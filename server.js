@@ -16,6 +16,7 @@ const followupsPath = join(dataDir, "followups.json");
 const PORT = Number(process.env.PORT || 3030);
 const PUBLIC_BASE_URL = cleanUrl(process.env.PUBLIC_BASE_URL || "");
 const SITE_ORIGIN = process.env.SITE_ORIGIN || "https://chronotradehub.com";
+let graphTokenCache = null;
 
 const companyProfile = {
   name: "ChronoTrade",
@@ -810,14 +811,15 @@ function notionProperties(lead) {
 }
 
 async function sendViaGraph(email) {
-  if (!process.env.MICROSOFT_GRAPH_TOKEN || !process.env.OUTLOOK_FROM_EMAIL) {
+  const tokenResult = await getMicrosoftGraphToken();
+  if (!tokenResult.enabled || !process.env.OUTLOOK_FROM_EMAIL) {
     return { enabled: false, message: "Variables Outlook Graph absentes." };
   }
 
   const response = await fetch(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(process.env.OUTLOOK_FROM_EMAIL)}/sendMail`, {
     method: "POST",
     headers: {
-      authorization: `Bearer ${process.env.MICROSOFT_GRAPH_TOKEN}`,
+      authorization: `Bearer ${tokenResult.token}`,
       "content-type": "application/json"
     },
     body: JSON.stringify({
@@ -844,6 +846,48 @@ async function sendViaGraph(email) {
     ok: response.ok,
     message: response.ok ? "Email envoye." : await response.text()
   };
+}
+
+async function getMicrosoftGraphToken() {
+  if (process.env.MICROSOFT_GRAPH_TOKEN) {
+    return { enabled: true, token: process.env.MICROSOFT_GRAPH_TOKEN };
+  }
+
+  const tenantId = process.env.MICROSOFT_TENANT_ID;
+  const clientId = process.env.MICROSOFT_CLIENT_ID;
+  const clientSecret = process.env.MICROSOFT_CLIENT_SECRET;
+  if (!tenantId || !clientId || !clientSecret) {
+    return { enabled: false };
+  }
+
+  const now = Date.now();
+  if (graphTokenCache && graphTokenCache.expiresAt > now + 60000) {
+    return { enabled: true, token: graphTokenCache.token };
+  }
+
+  const body = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    scope: "https://graph.microsoft.com/.default",
+    grant_type: "client_credentials"
+  });
+
+  const response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body
+  });
+
+  if (!response.ok) {
+    return { enabled: false, message: await response.text() };
+  }
+
+  const payload = await response.json();
+  graphTokenCache = {
+    token: payload.access_token,
+    expiresAt: now + Number(payload.expires_in || 3600) * 1000
+  };
+  return { enabled: true, token: graphTokenCache.token };
 }
 
 async function sendInternalNotification(lead) {
