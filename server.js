@@ -816,7 +816,11 @@ async function sendViaGraph(email) {
     return { enabled: false, message: "Variables Outlook Graph absentes." };
   }
 
-  const response = await fetch(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(process.env.OUTLOOK_FROM_EMAIL)}/sendMail`, {
+  const sendPath = tokenResult.delegated
+    ? "me"
+    : `users/${encodeURIComponent(process.env.OUTLOOK_FROM_EMAIL)}`;
+
+  const response = await fetch(`https://graph.microsoft.com/v1.0/${sendPath}/sendMail`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${tokenResult.token}`,
@@ -856,6 +860,11 @@ async function getMicrosoftGraphToken() {
   const tenantId = process.env.MICROSOFT_TENANT_ID;
   const clientId = process.env.MICROSOFT_CLIENT_ID;
   const clientSecret = process.env.MICROSOFT_CLIENT_SECRET;
+  const refreshToken = process.env.MICROSOFT_REFRESH_TOKEN;
+  if (clientId && clientSecret && refreshToken) {
+    return getMicrosoftGraphTokenFromRefreshToken(clientId, clientSecret, refreshToken);
+  }
+
   if (!tenantId || !clientId || !clientSecret) {
     return { enabled: false };
   }
@@ -887,7 +896,40 @@ async function getMicrosoftGraphToken() {
     token: payload.access_token,
     expiresAt: now + Number(payload.expires_in || 3600) * 1000
   };
-  return { enabled: true, token: graphTokenCache.token };
+  return { enabled: true, token: graphTokenCache.token, delegated: false };
+}
+
+async function getMicrosoftGraphTokenFromRefreshToken(clientId, clientSecret, refreshToken) {
+  const now = Date.now();
+  if (graphTokenCache && graphTokenCache.expiresAt > now + 60000) {
+    return { enabled: true, token: graphTokenCache.token, delegated: true };
+  }
+
+  const tenant = process.env.MICROSOFT_TENANT_ID || "common";
+  const body = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    scope: "https://graph.microsoft.com/Mail.Send offline_access",
+    grant_type: "refresh_token"
+  });
+
+  const response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body
+  });
+
+  if (!response.ok) {
+    return { enabled: false, message: await response.text() };
+  }
+
+  const payload = await response.json();
+  graphTokenCache = {
+    token: payload.access_token,
+    expiresAt: now + Number(payload.expires_in || 3600) * 1000
+  };
+  return { enabled: true, token: graphTokenCache.token, delegated: true };
 }
 
 async function sendInternalNotification(lead) {
