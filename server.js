@@ -861,7 +861,7 @@ async function getMicrosoftGraphToken() {
   const clientId = process.env.MICROSOFT_CLIENT_ID;
   const clientSecret = process.env.MICROSOFT_CLIENT_SECRET;
   const refreshToken = process.env.MICROSOFT_REFRESH_TOKEN;
-  if (clientId && clientSecret && refreshToken) {
+  if (clientId && refreshToken) {
     return getMicrosoftGraphTokenFromRefreshToken(clientId, clientSecret, refreshToken);
   }
 
@@ -908,11 +908,11 @@ async function getMicrosoftGraphTokenFromRefreshToken(clientId, clientSecret, re
   const tenant = process.env.MICROSOFT_TENANT_ID || "common";
   const body = new URLSearchParams({
     client_id: clientId,
-    client_secret: clientSecret,
     refresh_token: refreshToken,
     scope: "https://graph.microsoft.com/Mail.Send offline_access",
     grant_type: "refresh_token"
   });
+  if (clientSecret) body.set("client_secret", clientSecret);
 
   const response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/token`, {
     method: "POST",
