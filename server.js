@@ -942,6 +942,12 @@ async function sendInternalNotification(lead) {
   });
 }
 
+async function sendClientEmails(lead) {
+  const reply = await sendViaGraph(lead.replyEmail);
+  const quote = await sendViaGraph(lead.quoteEmail);
+  return { reply, quote };
+}
+
 async function sendDueFollowups() {
   const followups = await readJson(followupsPath, []);
   const now = new Date();
@@ -1004,13 +1010,24 @@ async function createLead(res, service, answers) {
     const savedLead = await upsertLocalLead(lead);
     const notion = await syncNotion(savedLead);
     const notification = await sendInternalNotification(savedLead);
+    const clientEmails = await sendClientEmails(savedLead);
 
     await addOutbox([
-      { id: randomUUID(), leadId: savedLead.id, type: "reply", createdAt: now, ...savedLead.replyEmail },
+      {
+        id: randomUUID(),
+        leadId: savedLead.id,
+        type: "reply",
+        status: clientEmails.reply.ok ? "sent" : "prepared",
+        sendResult: clientEmails.reply,
+        createdAt: now,
+        ...savedLead.replyEmail
+      },
       {
         id: randomUUID(),
         leadId: savedLead.id,
         type: "quote",
+        status: clientEmails.quote.ok ? "sent" : "prepared",
+        sendResult: clientEmails.quote,
         createdAt: now,
         attachmentFiles: [savedLead.quoteHtmlPath],
         quote: savedLead.quote,
@@ -1031,7 +1048,7 @@ async function createLead(res, service, answers) {
         replyEmail: savedLead.replyEmail,
         quoteEmail: savedLead.quoteEmail
       },
-      integrations: { notion, notification }
+      integrations: { notion, notification, clientEmails }
     });
 }
 
