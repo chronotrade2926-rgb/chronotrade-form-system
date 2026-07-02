@@ -69,6 +69,14 @@ const formSchemas = {
 
 const commonFields = ["firstName", "lastName", "email", "phone", "company", "budget", "deadline", "message"];
 
+const serviceMinimums = {
+  site_web: 900,
+  automatisation_ia: 850,
+  branding: 650,
+  application_web: 2800,
+  demande_generale: 600
+};
+
 const quotePresets = {
   site_web: {
     title: "Creation site web",
@@ -309,6 +317,127 @@ function mapLiveOsForm(fields) {
   };
 }
 
+function mapLiveBusinessForm(fields) {
+  const name = splitName(fields.nom);
+  return {
+    service: "demande_generale",
+    answers: {
+      ...name,
+      email: fields.email,
+      phone: fields.telephone,
+      company: fields.entreprise || "Non precise",
+      requestTopic: `ChronoTrade Business - ${fields.besoin || "Demande business"}`,
+      message: [
+        fields.situation && `Situation : ${fields.situation}`,
+        fields.objectif && `Objectif : ${fields.objectif}`,
+        fields.urgence && `Urgence : ${fields.urgence}`
+      ].filter(Boolean).join("\n"),
+      budget: fields.budget,
+      deadline: fields.delai,
+      sector: fields.secteur,
+      companySize: fields.taille,
+      need: fields.besoin,
+      urgency: fields.urgence
+    }
+  };
+}
+
+function mapLivePartnerForm(fields) {
+  const name = splitName(fields.nom);
+  return {
+    service: "demande_generale",
+    answers: {
+      ...name,
+      email: fields.email,
+      phone: fields.telephone,
+      company: fields.entreprise || fields.nom || "Candidat partenaire",
+      requestTopic: `Candidature partenaire - ${fields.metier || "Profil a qualifier"}`,
+      message: [
+        fields.presentation && `Presentation : ${fields.presentation}`,
+        fields.realisations && `Realisations : ${fields.realisations}`,
+        fields.pourquoi && `Motivation : ${fields.pourquoi}`
+      ].filter(Boolean).join("\n"),
+      budget: "Non applicable - candidature partenaire",
+      deadline: "A qualifier",
+      location: fields.zone_geo,
+      job: fields.metier,
+      experience: fields.annees_experience,
+      website: fields.site_internet,
+      linkedin: fields.linkedin,
+      portfolio: fields.portfolio,
+      clientTypes: fields.clients_type,
+      longTerm: fields.collaboration_long_terme
+    }
+  };
+}
+
+function mapLiveStudioForm(fields) {
+  const name = splitName(fields.nom);
+  const type = cleanString(fields.type_projet_studio);
+  const typeKey = normalizeForScoring(type);
+  const serviceMap = {
+    "site web": "site_web",
+    "landing page": "site_web",
+    "refonte": "site_web",
+    "application web": "application_web",
+    "prototype": "application_web",
+    "logo": "branding",
+    "charte graphique": "branding",
+    "identite visuelle complete": "branding",
+    "direction artistique": "branding"
+  };
+  const service = serviceMap[typeKey] || "demande_generale";
+  const base = {
+    ...name,
+    email: fields.email,
+    phone: fields.telephone,
+    company: fields.entreprise || "Non precise",
+    budget: fields.budget,
+    deadline: fields.delai,
+    message: fields.message,
+    requestTopic: `ChronoTrade Studio - ${type || "Projet studio"}`,
+    description: fields.vision_projet,
+    currentSituation: fields.situation_actuelle,
+    existingWebsite: fields.site_existant,
+    imageProblem: fields.probleme_image,
+    references: fields.references,
+    studioGoal: fields.objectif_studio
+  };
+
+  if (service === "site_web") {
+    base.websiteType = type || "A qualifier";
+    base.mainGoal = fields.objectif_studio || fields.vision_projet;
+    base.currentWebsite = fields.site_existant;
+    base.features = fields.vision_projet;
+    base.pagesNeeded = type === "Landing page" ? "1 page" : "A qualifier";
+  } else if (service === "application_web") {
+    base.appGoal = fields.objectif_studio || fields.vision_projet;
+    base.userTypes = "A qualifier";
+    base.coreFeatures = fields.vision_projet;
+  } else if (service === "branding") {
+    base.brandNeed = type || "Branding";
+    base.targetAudience = "A qualifier";
+    base.styleDirection = fields.vision_projet || fields.probleme_image;
+    base.existingBrand = fields.situation_actuelle;
+    base.deliverables = type || "A qualifier";
+    base.competitors = fields.references;
+  }
+  return { service, answers: base };
+}
+
+function mapLiveFormByKind(kind, fields) {
+  const mappers = {
+    devis: mapLiveDevisForm,
+    os: mapLiveOsForm,
+    business: mapLiveBusinessForm,
+    partner: mapLivePartnerForm,
+    studio: mapLiveStudioForm
+  };
+  const mapper = mappers[kind];
+  if (!mapper) return { service: "", answers: {} };
+  return mapper(fields);
+}
+
 function renderList(value) {
   return Array.isArray(value) ? value.join(", ") : cleanString(value);
 }
@@ -398,7 +527,9 @@ function buildQuoteProposal(lead) {
   const preset = quotePresets[lead.service] || quotePresets.demande_generale;
   const budget = parseBudget(lead.answers.budget);
   const rawTotal = preset.items.reduce((sum, item) => sum + item[1], 0);
-  const target = alignTotalWithBudget(rawTotal, budget);
+  const complexity = assessComplexity(lead);
+  const complexityTotal = rawTotal * complexity.multiplier;
+  const target = alignTotalWithBudget(complexityTotal, budget, lead.service);
   const ratio = target / rawTotal;
   const items = preset.items.map(([label, amount]) => ({
     label,
@@ -417,7 +548,9 @@ function buildQuoteProposal(lead) {
     total: adjustedTotal,
     currency: "EUR",
     budgetRequested: lead.answers.budget || "A definir",
-    pricingNote: budget.note,
+    complexity: complexity.label,
+    complexityScore: complexity.score,
+    pricingNote: buildPricingNote(budget, adjustedTotal, lead.service, complexity),
     items,
     assumptions: quoteAssumptions(lead),
     nextSteps: [
@@ -427,6 +560,58 @@ function buildQuoteProposal(lead) {
       "Demarrage production apres validation"
     ]
   };
+}
+
+function normalizeForScoring(value) {
+  return cleanString(Array.isArray(value) ? value.join(" ") : value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function assessComplexity(lead) {
+  const text = normalizeForScoring(Object.values(lead.answers).flat().join(" "));
+  let score = 0;
+  const markers = [
+    "application", "saas", "back-office", "back office", "dashboard", "paiement", "stripe",
+    "connexion", "integration", "api", "automatisation", "agent ia", "ia", "notion",
+    "crm", "espace client", "compte utilisateur", "authentification", "base de donnees",
+    "multi", "sur mesure", "refonte", "e-commerce", "ecommerce", "reservation",
+    "calendly", "workflow", "relance", "devis", "support client"
+  ];
+  for (const marker of markers) if (text.includes(marker)) score += 1;
+
+  if (lead.service === "application_web") score += 5;
+  if (lead.service === "automatisation_ia") score += 3;
+  if (lead.service === "site_web") score += 1;
+
+  const pageText = normalizeForScoring(lead.answers.pagesNeeded || lead.answers.pageCount || "");
+  const pageNumbers = [...pageText.matchAll(/\d+/g)].map((match) => Number(match[0]));
+  if (pageNumbers.some((value) => value >= 5)) score += 2;
+  if (pageNumbers.some((value) => value >= 10)) score += 3;
+
+  const deadline = normalizeForScoring(lead.answers.deadline);
+  if (deadline.includes("urgent") || deadline.includes("des que possible") || deadline.includes("moins de 2")) score += 2;
+
+  const arrayFields = Object.values(lead.answers).filter(Array.isArray).reduce((sum, value) => sum + value.length, 0);
+  if (arrayFields >= 4) score += 1;
+  if (arrayFields >= 8) score += 2;
+
+  if (score >= 10) return { score, label: "Complexe", multiplier: 1.55 };
+  if (score >= 6) return { score, label: "Avance", multiplier: 1.25 };
+  if (score >= 3) return { score, label: "Intermediaire", multiplier: 1.08 };
+  return { score, label: "Simple", multiplier: 1 };
+}
+
+function buildPricingNote(budget, total, service, complexity) {
+  const minimum = serviceMinimums[service] || serviceMinimums.demande_generale;
+  if (budget.max && budget.max < minimum) {
+    return `Budget indique inferieur au minimum realiste pour ce type de projet. Estimation basee sur le perimetre et la complexite ${complexity.label.toLowerCase()}, pas uniquement sur le budget annonce.`;
+  }
+  if (budget.max && total > budget.max * 1.25) {
+    return `Le budget annonce semble sous-estime par rapport au perimetre demande. Le prix propose correspond a une livraison professionnelle et a la complexite ${complexity.label.toLowerCase()} detectee.`;
+  }
+  return `${budget.note} Complexite estimee : ${complexity.label}.`;
 }
 
 function parseBudget(value) {
@@ -442,12 +627,20 @@ function parseBudget(value) {
   return { min: nums[0] * 0.8, max: nums[0] * 1.2, note: "Estimation alignee avec le montant communique." };
 }
 
-function alignTotalWithBudget(rawTotal, budget) {
-  const min = Math.max(350, budget.min || 0);
-  const max = Math.max(min + 250, budget.max || rawTotal);
-  if (rawTotal < min) return min;
-  if (rawTotal > max) return Math.max(350, max * 0.92);
-  return rawTotal;
+function alignTotalWithBudget(rawTotal, budget, service) {
+  const minimum = serviceMinimums[service] || serviceMinimums.demande_generale;
+  const realisticTotal = Math.max(rawTotal, minimum);
+  if (!budget.max) return realisticTotal;
+
+  const budgetIsTooLow = budget.max < minimum || budget.max < realisticTotal * 0.72;
+  if (budgetIsTooLow) return realisticTotal;
+
+  if (realisticTotal > budget.max && realisticTotal <= budget.max * 1.25) {
+    return Math.max(minimum, (realisticTotal + budget.max) / 2);
+  }
+
+  if (realisticTotal < budget.min) return Math.max(minimum, budget.min);
+  return realisticTotal;
 }
 
 function roundToNearest(value, step) {
@@ -976,7 +1169,7 @@ async function handleLead(req, res) {
 async function handleLiveForm(req, res, kind) {
   try {
     const fields = await readRequestBody(req);
-    const mapped = kind === "os" ? mapLiveOsForm(fields) : mapLiveDevisForm(fields);
+    const mapped = mapLiveFormByKind(kind, fields);
     return createLead(res, mapped.service, normalizePayload(mapped.answers));
   } catch (error) {
     jsonResponse(res, 500, { ok: false, error: error.message });
@@ -1167,6 +1360,9 @@ createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/api/leads") return handleLead(req, res);
   if (req.method === "POST" && url.pathname === "/api/forms/devis") return handleLiveForm(req, res, "devis");
   if (req.method === "POST" && url.pathname === "/api/forms/os") return handleLiveForm(req, res, "os");
+  if (req.method === "POST" && url.pathname === "/api/forms/business") return handleLiveForm(req, res, "business");
+  if (req.method === "POST" && url.pathname === "/api/forms/partner") return handleLiveForm(req, res, "partner");
+  if (req.method === "POST" && url.pathname === "/api/forms/studio") return handleLiveForm(req, res, "studio");
   if (req.method === "GET" && url.pathname === "/api/leads") return handleListLeads(res);
   if (req.method === "GET" && url.pathname === "/api/followups/due") return handleDueFollowups(res);
   if (req.method === "POST" && url.pathname === "/api/followups/run") return handleRunFollowups(res);
