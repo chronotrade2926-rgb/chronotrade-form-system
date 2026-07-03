@@ -1089,21 +1089,32 @@ function isStudioLead(lead) {
   return cleanString(lead.answers.requestTopic).toLowerCase().startsWith("chronotrade studio");
 }
 
+function slugify(value) {
+  return cleanString(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 72) || randomUUID().slice(0, 8);
+}
+
 async function syncSupabase(lead) {
   try {
     if (isPartnerLead(lead)) {
       return await supabaseInsert("partners", {
-        name: fullNameFromLead(lead),
-        company: lead.answers.company || "",
+        first_name: lead.answers.firstName || "",
+        last_name: lead.answers.lastName || "",
+        company_name: lead.answers.company || "",
         email: lead.email,
         phone: lead.answers.phone || "",
         category: lead.answers.job || "",
         expertise: lead.answers.clientTypes || "",
         city: lead.answers.location || "",
         website: lead.answers.website || "",
+        instagram: lead.answers.portfolio || "",
         linkedin: lead.answers.linkedin || "",
         description: leadDescription(lead),
-        portfolio_url: lead.answers.portfolio || "",
         status: "pending"
       });
     }
@@ -1115,6 +1126,7 @@ async function syncSupabase(lead) {
         company: lead.answers.company || "",
         need_type: lead.answers.need || lead.answers.requestTopic || "",
         category_requested: lead.answers.sector || "",
+        city: lead.answers.city || lead.answers.location || "",
         description: leadDescription(lead),
         budget: lead.answers.budget || "",
         urgency: lead.answers.urgency || lead.answers.deadline || "",
@@ -1124,11 +1136,17 @@ async function syncSupabase(lead) {
 
     if (lead.service === "chronotrade_launch" || lead.service === "automatisation_ia" || isStudioLead(lead)) {
       return await supabaseInsert("projects", {
-        client_name: fullNameFromLead(lead),
-        company: lead.answers.company || "",
-        universe: lead.service === "chronotrade_launch" ? "launch" : lead.service === "automatisation_ia" ? "os" : "studio",
         title: lead.answers.requestTopic || lead.serviceLabel || "Projet ChronoTrade",
-        status: "prototype"
+        slug: slugify(`${lead.serviceLabel || lead.service}-${lead.id}`),
+        client_name: fullNameFromLead(lead),
+        universe: lead.service === "chronotrade_launch" ? "launch" : lead.service === "automatisation_ia" ? "os" : "studio",
+        category: lead.serviceLabel || lead.service,
+        short_description: leadDescription(lead).slice(0, 260),
+        problem: lead.answers.mainBlocker || lead.answers.currentPain || lead.answers.imageProblem || "",
+        solution: lead.summary || "",
+        result: "Projet cree automatiquement depuis un formulaire ChronoTrade.",
+        status: "draft",
+        featured: false
       });
     }
 
