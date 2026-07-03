@@ -16,6 +16,8 @@ const followupsPath = join(dataDir, "followups.json");
 const PORT = Number(process.env.PORT || 3030);
 const PUBLIC_BASE_URL = cleanUrl(process.env.PUBLIC_BASE_URL || "");
 const SITE_ORIGIN = process.env.SITE_ORIGIN || "https://chronotradehub.com";
+const SUPABASE_URL = cleanUrl(process.env.SUPABASE_URL || "");
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 let graphTokenCache = null;
 
 const companyProfile = {
@@ -37,6 +39,7 @@ const statuses = [
 ];
 
 const serviceLabels = {
+  chronotrade_launch: "ChronoTrade Launch",
   site_web: "Site web",
   automatisation_ia: "Automatisation IA",
   branding: "Branding",
@@ -45,6 +48,10 @@ const serviceLabels = {
 };
 
 const formSchemas = {
+  chronotrade_launch: {
+    required: ["firstName", "lastName", "email", "company", "projectIdea", "stage", "mainBlocker", "budget", "deadline"],
+    fields: ["targetCustomer", "neededAssets", "launchGoal", "message"]
+  },
   site_web: {
     required: ["firstName", "lastName", "email", "company", "websiteType", "mainGoal", "budget", "deadline"],
     fields: ["currentWebsite", "pagesNeeded", "features", "brandAssets", "contentReady"]
@@ -70,6 +77,7 @@ const formSchemas = {
 const commonFields = ["firstName", "lastName", "email", "phone", "company", "budget", "deadline", "message"];
 
 const serviceMinimums = {
+  chronotrade_launch: 750,
   site_web: 900,
   automatisation_ia: 850,
   branding: 650,
@@ -78,6 +86,16 @@ const serviceMinimums = {
 };
 
 const quotePresets = {
+  chronotrade_launch: {
+    title: "ChronoTrade Launch",
+    duration: "1 a 3 semaines",
+    items: [
+      ["Clarification de l'idee et cadrage du projet", 250],
+      ["Positionnement, offre et angle commercial", 350],
+      ["Structure de lancement et priorites d'action", 450],
+      ["Kit de demarrage digital et recommandations", 300]
+    ]
+  },
   site_web: {
     title: "Creation site web",
     duration: "2 a 4 semaines",
@@ -317,6 +335,29 @@ function mapLiveOsForm(fields) {
   };
 }
 
+function mapLiveLaunchForm(fields) {
+  const name = splitName(fields.nom);
+  return {
+    service: "chronotrade_launch",
+    answers: {
+      ...name,
+      email: fields.email,
+      phone: fields.telephone,
+      company: fields.entreprise || "Projet en creation",
+      projectIdea: fields.idee_projet,
+      stage: fields.stade_projet,
+      mainBlocker: fields.blocage_principal,
+      targetCustomer: fields.client_cible,
+      neededAssets: renderList(fields.besoins_launch),
+      launchGoal: fields.objectif_launch,
+      budget: fields.budget,
+      deadline: fields.delai,
+      message: fields.message,
+      requestTopic: "ChronoTrade Launch - Structuration projet"
+    }
+  };
+}
+
 function mapLiveBusinessForm(fields) {
   const name = splitName(fields.nom);
   return {
@@ -428,6 +469,7 @@ function mapLiveStudioForm(fields) {
 function mapLiveFormByKind(kind, fields) {
   const mappers = {
     devis: mapLiveDevisForm,
+    launch: mapLiveLaunchForm,
     os: mapLiveOsForm,
     business: mapLiveBusinessForm,
     partner: mapLivePartnerForm,
@@ -987,6 +1029,115 @@ async function syncNotion(lead) {
   };
 }
 
+async function supabaseInsert(table, payload) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    return { enabled: false, message: "Variables Supabase absentes." };
+  }
+
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "content-type": "application/json",
+      prefer: "return=representation"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+
+  return {
+    enabled: true,
+    ok: response.ok,
+    table,
+    data,
+    message: response.ok ? "Synchronisation Supabase reussie." : text
+  };
+}
+
+function fullNameFromLead(lead) {
+  return `${lead.answers.firstName || ""} ${lead.answers.lastName || ""}`.trim() || "Prospect ChronoTrade";
+}
+
+function leadDescription(lead) {
+  return [
+    lead.answers.description,
+    lead.answers.message,
+    lead.answers.mainGoal,
+    lead.answers.appGoal,
+    lead.answers.processToAutomate,
+    lead.answers.studioGoal
+  ].filter(Boolean).join("\n\n").slice(0, 4000);
+}
+
+function isPartnerLead(lead) {
+  return cleanString(lead.answers.requestTopic).toLowerCase().startsWith("candidature partenaire");
+}
+
+function isBusinessLead(lead) {
+  return cleanString(lead.answers.requestTopic).toLowerCase().startsWith("chronotrade business");
+}
+
+function isStudioLead(lead) {
+  return cleanString(lead.answers.requestTopic).toLowerCase().startsWith("chronotrade studio");
+}
+
+async function syncSupabase(lead) {
+  try {
+    if (isPartnerLead(lead)) {
+      return await supabaseInsert("partners", {
+        name: fullNameFromLead(lead),
+        company: lead.answers.company || "",
+        email: lead.email,
+        phone: lead.answers.phone || "",
+        category: lead.answers.job || "",
+        expertise: lead.answers.clientTypes || "",
+        city: lead.answers.location || "",
+        website: lead.answers.website || "",
+        linkedin: lead.answers.linkedin || "",
+        description: leadDescription(lead),
+        portfolio_url: lead.answers.portfolio || "",
+        status: "pending"
+      });
+    }
+
+    if (isBusinessLead(lead)) {
+      return await supabaseInsert("business_requests", {
+        full_name: fullNameFromLead(lead),
+        email: lead.email,
+        company: lead.answers.company || "",
+        need_type: lead.answers.need || lead.answers.requestTopic || "",
+        category_requested: lead.answers.sector || "",
+        description: leadDescription(lead),
+        budget: lead.answers.budget || "",
+        urgency: lead.answers.urgency || lead.answers.deadline || "",
+        status: "new"
+      });
+    }
+
+    if (lead.service === "chronotrade_launch" || lead.service === "automatisation_ia" || isStudioLead(lead)) {
+      return await supabaseInsert("projects", {
+        client_name: fullNameFromLead(lead),
+        company: lead.answers.company || "",
+        universe: lead.service === "chronotrade_launch" ? "launch" : lead.service === "automatisation_ia" ? "os" : "studio",
+        title: lead.answers.requestTopic || lead.serviceLabel || "Projet ChronoTrade",
+        status: "prototype"
+      });
+    }
+
+    return { enabled: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY), skipped: true, message: "Lead non mappe vers une table Supabase dediee." };
+  } catch (error) {
+    return { enabled: true, ok: false, message: error.message };
+  }
+}
+
 function notionProperties(lead) {
   const label = serviceLabels[lead.service] || lead.service;
   return {
@@ -1202,6 +1353,7 @@ async function createLead(res, service, answers) {
 
     const savedLead = await upsertLocalLead(lead);
     const notion = await syncNotion(savedLead);
+    const supabase = await syncSupabase(savedLead);
     const notification = await sendInternalNotification(savedLead);
     const clientEmails = await sendClientEmails(savedLead);
 
@@ -1241,7 +1393,7 @@ async function createLead(res, service, answers) {
         replyEmail: savedLead.replyEmail,
         quoteEmail: savedLead.quoteEmail
       },
-      integrations: { notion, notification, clientEmails }
+      integrations: { notion, supabase, notification, clientEmails }
     });
 }
 
@@ -1359,6 +1511,7 @@ createServer((req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/leads") return handleLead(req, res);
   if (req.method === "POST" && url.pathname === "/api/forms/devis") return handleLiveForm(req, res, "devis");
+  if (req.method === "POST" && url.pathname === "/api/forms/launch") return handleLiveForm(req, res, "launch");
   if (req.method === "POST" && url.pathname === "/api/forms/os") return handleLiveForm(req, res, "os");
   if (req.method === "POST" && url.pathname === "/api/forms/business") return handleLiveForm(req, res, "business");
   if (req.method === "POST" && url.pathname === "/api/forms/partner") return handleLiveForm(req, res, "partner");
