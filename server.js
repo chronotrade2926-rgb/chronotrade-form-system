@@ -18,6 +18,16 @@ const PUBLIC_BASE_URL = cleanUrl(process.env.PUBLIC_BASE_URL || "");
 const SITE_ORIGIN = process.env.SITE_ORIGIN || "https://chronotradehub.com";
 const SUPABASE_URL = cleanUrl(process.env.SUPABASE_URL || "");
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
+const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
+const STRIPE_ANALYSE_EXPRESS_PRICE_ID = process.env.STRIPE_ANALYSE_EXPRESS_PRICE_ID || "";
+const GOOGLE_BUSINESS_REVIEW_URL = process.env.GOOGLE_BUSINESS_REVIEW_URL || "";
+const GOOGLE_BUSINESS_PROFILE_URL = process.env.GOOGLE_BUSINESS_PROFILE_URL || "";
+const GOOGLE_BUSINESS_ACCOUNT_ID = process.env.GOOGLE_BUSINESS_ACCOUNT_ID || "";
+const GOOGLE_BUSINESS_LOCATION_ID = process.env.GOOGLE_BUSINESS_LOCATION_ID || "";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || "";
 let graphTokenCache = null;
 
 const companyProfile = {
@@ -39,6 +49,7 @@ const statuses = [
 ];
 
 const serviceLabels = {
+  chronotrade_vision: "ChronoTrade Vision",
   chronotrade_launch: "ChronoTrade Launch",
   site_web: "Site web",
   automatisation_ia: "Automatisation IA",
@@ -48,6 +59,10 @@ const serviceLabels = {
 };
 
 const formSchemas = {
+  chronotrade_vision: {
+    required: ["firstName", "lastName", "email", "currentSituation", "skills", "interests", "goals", "mainBlocker", "budget", "deadline"],
+    fields: ["values", "entrepreneurProfile", "opportunities", "recommendedModel", "message"]
+  },
   chronotrade_launch: {
     required: ["firstName", "lastName", "email", "company", "projectIdea", "stage", "mainBlocker", "budget", "deadline"],
     fields: ["targetCustomer", "neededAssets", "launchGoal", "message"]
@@ -77,6 +92,7 @@ const formSchemas = {
 const commonFields = ["firstName", "lastName", "email", "phone", "company", "budget", "deadline", "message"];
 
 const serviceMinimums = {
+  chronotrade_vision: 490,
   chronotrade_launch: 750,
   site_web: 900,
   automatisation_ia: 850,
@@ -86,6 +102,16 @@ const serviceMinimums = {
 };
 
 const quotePresets = {
+  chronotrade_vision: {
+    title: "ChronoTrade Vision",
+    duration: "1 a 2 semaines",
+    items: [
+      ["Diagnostic personnel, forces et blocages", 190],
+      ["Exploration des pistes et opportunites adaptees", 240],
+      ["Selection d'idees et business model recommande", 290],
+      ["Roadmap claire et prochaines etapes", 220]
+    ]
+  },
   chronotrade_launch: {
     title: "ChronoTrade Launch",
     duration: "1 a 3 semaines",
@@ -358,6 +384,32 @@ function mapLiveLaunchForm(fields) {
   };
 }
 
+function mapLiveVisionForm(fields) {
+  const name = splitName(fields.nom);
+  return {
+    service: "chronotrade_vision",
+    answers: {
+      ...name,
+      email: fields.email,
+      phone: fields.telephone,
+      company: fields.entreprise || "Projet a definir",
+      currentSituation: fields.situation_actuelle,
+      skills: fields.competences,
+      interests: fields.centres_interet,
+      goals: fields.objectifs,
+      mainBlocker: fields.blocages,
+      values: fields.valeurs,
+      entrepreneurProfile: fields.profil_souhaite,
+      opportunities: fields.opportunites,
+      recommendedModel: fields.modele_recherche,
+      budget: fields.budget,
+      deadline: fields.delai,
+      message: fields.message,
+      requestTopic: "ChronoTrade Vision - Trouver une direction claire"
+    }
+  };
+}
+
 function mapLiveBusinessForm(fields) {
   const name = splitName(fields.nom);
   return {
@@ -469,6 +521,7 @@ function mapLiveStudioForm(fields) {
 function mapLiveFormByKind(kind, fields) {
   const mappers = {
     devis: mapLiveDevisForm,
+    vision: mapLiveVisionForm,
     launch: mapLiveLaunchForm,
     os: mapLiveOsForm,
     business: mapLiveBusinessForm,
@@ -697,6 +750,7 @@ function quoteAssumptions(lead) {
     "Toute fonctionnalite non mentionnee fera l'objet d'un ajustement de perimetre."
   ];
   if (lead.service === "site_web") base.push("Le tarif inclut une structure responsive et un formulaire de contact.");
+  if (lead.service === "chronotrade_vision") base.push("Le tarif inclut une analyse de direction, plusieurs pistes adaptees et une roadmap exploitable.");
   if (lead.service === "automatisation_ia") base.push("Le tarif inclut la construction d'un workflow pilote et ses tests.");
   if (lead.service === "application_web") base.push("Le tarif suppose une premiere version exploitable, pas un produit SaaS complet multi-modules.");
   if (answers.message) base.push(`Point client a garder en tete : ${answers.message}`);
@@ -1455,6 +1509,195 @@ async function handleRunFollowups(res) {
   jsonResponse(res, 200, { ok: true, results });
 }
 
+async function handleAnalyseExpressCheckout(res) {
+  if (!STRIPE_SECRET_KEY) {
+    return jsonResponse(res, 503, {
+      ok: false,
+      error: "Stripe n'est pas encore configure. Ajoute STRIPE_SECRET_KEY dans Render."
+    });
+  }
+
+  const successUrl = `${SITE_ORIGIN}/contact/?catalogue=analyse-express&paiement=success`;
+  const cancelUrl = `${SITE_ORIGIN}/?catalogue=analyse-express&paiement=cancel`;
+  const body = new URLSearchParams({
+    mode: "payment",
+    success_url: successUrl,
+    cancel_url: cancelUrl,
+    "metadata[product]": "analyse_express",
+    "metadata[source]": "chronotrade_catalogue"
+  });
+
+  if (STRIPE_ANALYSE_EXPRESS_PRICE_ID) {
+    body.set("line_items[0][price]", STRIPE_ANALYSE_EXPRESS_PRICE_ID);
+    body.set("line_items[0][quantity]", "1");
+  } else {
+    body.set("line_items[0][quantity]", "1");
+    body.set("line_items[0][price_data][currency]", "eur");
+    body.set("line_items[0][price_data][unit_amount]", "2900");
+    body.set("line_items[0][price_data][product_data][name]", "Analyse Express ChronoTrade");
+    body.set("line_items[0][price_data][product_data][description]", "Audit express de votre projet, idee ou presence digitale avec plan d'action clair.");
+  }
+
+  try {
+    const stripeResponse = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+        "content-type": "application/x-www-form-urlencoded"
+      },
+      body
+    });
+    const session = await stripeResponse.json();
+    if (!stripeResponse.ok || !session.url) {
+      return jsonResponse(res, 502, { ok: false, error: session.error?.message || "Impossible de creer le paiement Stripe." });
+    }
+    res.writeHead(303, { location: session.url, ...corsHeaders() });
+    res.end();
+  } catch (error) {
+    jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+function applyAnalyseExpressLineItem(body) {
+  if (STRIPE_ANALYSE_EXPRESS_PRICE_ID) {
+    body.set("line_items[0][price]", STRIPE_ANALYSE_EXPRESS_PRICE_ID);
+    body.set("line_items[0][quantity]", "1");
+    return;
+  }
+  body.set("line_items[0][quantity]", "1");
+  body.set("line_items[0][price_data][currency]", "eur");
+  body.set("line_items[0][price_data][unit_amount]", "2900");
+  body.set("line_items[0][price_data][product_data][name]", "Analyse Express ChronoTrade");
+  body.set("line_items[0][price_data][product_data][description]", "Audit express de votre projet, idee ou presence digitale avec plan d'action clair.");
+}
+
+async function createStripeCheckoutSession(body) {
+  const stripeResponse = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+      "content-type": "application/x-www-form-urlencoded"
+    },
+    body
+  });
+  const session = await stripeResponse.json();
+  return { stripeResponse, session };
+}
+
+async function handleAnalyseExpressEmbeddedCheckout(res) {
+  if (!STRIPE_SECRET_KEY || !STRIPE_PUBLISHABLE_KEY) {
+    return jsonResponse(res, 503, {
+      ok: false,
+      error: "Stripe embedded checkout n'est pas encore configure. Ajoute STRIPE_SECRET_KEY et STRIPE_PUBLISHABLE_KEY dans Render."
+    });
+  }
+
+  const body = new URLSearchParams({
+    mode: "payment",
+    ui_mode: "embedded",
+    return_url: `${SITE_ORIGIN}/?catalogue=analyse-express&paiement=success&session_id={CHECKOUT_SESSION_ID}`,
+    submit_type: "book",
+    "metadata[product]": "analyse_express",
+    "metadata[source]": "chronotrade_catalogue_embedded"
+  });
+  applyAnalyseExpressLineItem(body);
+
+  try {
+    const { stripeResponse, session } = await createStripeCheckoutSession(body);
+    if (!stripeResponse.ok || !session.client_secret) {
+      return jsonResponse(res, 502, { ok: false, error: session.error?.message || "Impossible de creer le paiement Stripe integre." });
+    }
+    jsonResponse(res, 200, { ok: true, id: session.id, clientSecret: session.client_secret });
+  } catch (error) {
+    jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+function handlePublicConfig(res) {
+  jsonResponse(res, 200, {
+    ok: true,
+    stripePublishableKey: STRIPE_PUBLISHABLE_KEY,
+    googleReviewUrl: GOOGLE_BUSINESS_REVIEW_URL,
+    googleProfileUrl: GOOGLE_BUSINESS_PROFILE_URL
+  });
+}
+
+async function fetchGoogleAccessToken() {
+  const body = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    client_secret: GOOGLE_CLIENT_SECRET,
+    refresh_token: GOOGLE_REFRESH_TOKEN,
+    grant_type: "refresh_token"
+  });
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload.access_token) {
+    throw new Error(payload.error_description || payload.error || "Impossible d'obtenir le token Google Business.");
+  }
+  return payload.access_token;
+}
+
+function googleRating(value) {
+  const map = { ONE: 1, TWO: 2, THREE: 3, FOUR: 4, FIVE: 5 };
+  if (typeof value === "number") return value;
+  return map[String(value || "").toUpperCase()] || 0;
+}
+
+function normalizeGoogleReview(review) {
+  return {
+    id: review.reviewId || review.name || randomUUID(),
+    author: review.reviewer?.displayName || "Client Google",
+    rating: googleRating(review.starRating),
+    text: cleanString(review.comment || ""),
+    createdAt: review.createTime || "",
+    updatedAt: review.updateTime || "",
+    profilePhotoUrl: review.reviewer?.profilePhotoUrl || ""
+  };
+}
+
+async function handleGoogleReviews(res) {
+  const configured = Boolean(GOOGLE_BUSINESS_ACCOUNT_ID && GOOGLE_BUSINESS_LOCATION_ID && GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_REFRESH_TOKEN);
+  if (!configured) {
+    return jsonResponse(res, 200, {
+      ok: true,
+      configured: false,
+      googleReviewUrl: GOOGLE_BUSINESS_REVIEW_URL,
+      googleProfileUrl: GOOGLE_BUSINESS_PROFILE_URL,
+      averageRating: null,
+      totalReviewCount: null,
+      reviews: []
+    });
+  }
+
+  try {
+    const accessToken = await fetchGoogleAccessToken();
+    const parent = `accounts/${encodeURIComponent(GOOGLE_BUSINESS_ACCOUNT_ID)}/locations/${encodeURIComponent(GOOGLE_BUSINESS_LOCATION_ID)}`;
+    const reviewsUrl = `https://mybusiness.googleapis.com/v4/${parent}/reviews?pageSize=6&orderBy=updateTime%20desc`;
+    const response = await fetch(reviewsUrl, {
+      headers: { authorization: `Bearer ${accessToken}` }
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      return jsonResponse(res, 502, { ok: false, configured: true, error: payload.error?.message || "Impossible de recuperer les avis Google.", googleReviewUrl: GOOGLE_BUSINESS_REVIEW_URL, googleProfileUrl: GOOGLE_BUSINESS_PROFILE_URL, reviews: [] });
+    }
+    jsonResponse(res, 200, {
+      ok: true,
+      configured: true,
+      googleReviewUrl: GOOGLE_BUSINESS_REVIEW_URL,
+      googleProfileUrl: GOOGLE_BUSINESS_PROFILE_URL,
+      averageRating: payload.averageRating || null,
+      totalReviewCount: payload.totalReviewCount || null,
+      reviews: (payload.reviews || []).map(normalizeGoogleReview)
+    });
+  } catch (error) {
+    jsonResponse(res, 500, { ok: false, configured: true, error: error.message, googleReviewUrl: GOOGLE_BUSINESS_REVIEW_URL, googleProfileUrl: GOOGLE_BUSINESS_PROFILE_URL, reviews: [] });
+  }
+}
+
 async function handleStatus(req, res, id) {
   try {
     const body = await readRequestBody(req);
@@ -1529,12 +1772,17 @@ createServer((req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/leads") return handleLead(req, res);
   if (req.method === "POST" && url.pathname === "/api/forms/devis") return handleLiveForm(req, res, "devis");
+  if (req.method === "POST" && url.pathname === "/api/forms/vision") return handleLiveForm(req, res, "vision");
   if (req.method === "POST" && url.pathname === "/api/forms/launch") return handleLiveForm(req, res, "launch");
   if (req.method === "POST" && url.pathname === "/api/forms/os") return handleLiveForm(req, res, "os");
   if (req.method === "POST" && url.pathname === "/api/forms/business") return handleLiveForm(req, res, "business");
   if (req.method === "POST" && url.pathname === "/api/forms/partner") return handleLiveForm(req, res, "partner");
   if (req.method === "POST" && url.pathname === "/api/forms/studio") return handleLiveForm(req, res, "studio");
   if (req.method === "GET" && url.pathname === "/api/leads") return handleListLeads(res);
+  if (req.method === "GET" && url.pathname === "/api/config/public") return handlePublicConfig(res);
+  if (req.method === "GET" && url.pathname === "/api/google-reviews") return handleGoogleReviews(res);
+  if (req.method === "GET" && url.pathname === "/api/checkout/analyse-express") return handleAnalyseExpressCheckout(res);
+  if (req.method === "POST" && url.pathname === "/api/checkout/analyse-express/session") return handleAnalyseExpressEmbeddedCheckout(res);
   if (req.method === "GET" && url.pathname === "/api/followups/due") return handleDueFollowups(res);
   if (req.method === "POST" && url.pathname === "/api/followups/run") return handleRunFollowups(res);
   if (req.method === "GET" && url.pathname.startsWith("/api/leads/") && url.pathname.endsWith("/quote")) {

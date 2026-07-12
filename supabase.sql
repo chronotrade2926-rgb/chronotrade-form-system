@@ -72,6 +72,40 @@ create table if not exists public.partner_matches (
   unique (request_id, partner_id)
 );
 
+create table if not exists public.user_diagnostics (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.users(id) on delete cascade,
+  input_text text,
+  selected_options jsonb not null default '[]'::jsonb,
+  recommended_services jsonb not null default '[]'::jsonb,
+  primary_service text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists user_diagnostics_user_id_idx on public.user_diagnostics(user_id, created_at desc);
+
+create table if not exists public.time_simulations (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references public.users(id) on delete cascade,
+  activity_type text,
+  weekly_requests text,
+  message_time text,
+  admin_time text,
+  tool_count text,
+  main_blocker text,
+  main_goal text,
+  lost_hours_month numeric,
+  recoverable_hours_min numeric,
+  recoverable_hours_max numeric,
+  estimated_value_min numeric,
+  estimated_value_max numeric,
+  recommended_service text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists time_simulations_user_id_idx on public.time_simulations(user_id, created_at desc);
+
 create table if not exists public.projects (
   id uuid primary key default gen_random_uuid(),
   title text not null,
@@ -96,3 +130,69 @@ create table if not exists public.projects (
 -- harden_platform_security_policies
 -- revoke_public_rpc_execution
 -- set_owner_email_as_admin
+
+alter table public.user_diagnostics enable row level security;
+
+grant select, insert, update, delete on public.user_diagnostics to authenticated;
+
+drop policy if exists "Users can read own diagnostics" on public.user_diagnostics;
+create policy "Users can read own diagnostics"
+on public.user_diagnostics
+for select
+to authenticated
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
+
+drop policy if exists "Users can insert own diagnostics" on public.user_diagnostics;
+create policy "Users can insert own diagnostics"
+on public.user_diagnostics
+for insert
+to authenticated
+with check ((select auth.uid()) = user_id);
+
+drop policy if exists "Users can update own diagnostics" on public.user_diagnostics;
+create policy "Users can update own diagnostics"
+on public.user_diagnostics
+for update
+to authenticated
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'))
+with check ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
+
+drop policy if exists "Users can delete own diagnostics" on public.user_diagnostics;
+create policy "Users can delete own diagnostics"
+on public.user_diagnostics
+for delete
+to authenticated
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
+
+alter table public.time_simulations enable row level security;
+
+grant select, insert, update, delete on public.time_simulations to authenticated;
+
+drop policy if exists "Users can read own time simulations" on public.time_simulations;
+create policy "Users can read own time simulations"
+on public.time_simulations
+for select
+to authenticated
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
+
+drop policy if exists "Users can insert own time simulations" on public.time_simulations;
+create policy "Users can insert own time simulations"
+on public.time_simulations
+for insert
+to authenticated
+with check ((select auth.uid()) = user_id);
+
+drop policy if exists "Users can update own time simulations" on public.time_simulations;
+create policy "Users can update own time simulations"
+on public.time_simulations
+for update
+to authenticated
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'))
+with check ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
+
+drop policy if exists "Users can delete own time simulations" on public.time_simulations;
+create policy "Users can delete own time simulations"
+on public.time_simulations
+for delete
+to authenticated
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
