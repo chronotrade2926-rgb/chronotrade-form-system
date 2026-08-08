@@ -10,7 +10,7 @@ create table if not exists public.users (
   first_name text,
   last_name text,
   full_name text,
-  role text not null default 'client' check (role in ('client', 'partner', 'admin')),
+  role text not null default 'client' check (role in ('client', 'partner', 'admin', 'super_admin')),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -22,6 +22,10 @@ create table if not exists public.admin_emails (
 
 insert into public.admin_emails(email)
 values ('flo.chronotrade@outlook.fr')
+on conflict (email) do nothing;
+
+insert into public.admin_emails(email)
+values ('bouchonneflorent@gmail.com'), ('chronotrade29-26@gmail.com')
 on conflict (email) do nothing;
 
 create table if not exists public.partners (
@@ -140,7 +144,7 @@ create policy "Users can read own diagnostics"
 on public.user_diagnostics
 for select
 to authenticated
-using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role in ('admin', 'super_admin')));
 
 drop policy if exists "Users can insert own diagnostics" on public.user_diagnostics;
 create policy "Users can insert own diagnostics"
@@ -154,15 +158,15 @@ create policy "Users can update own diagnostics"
 on public.user_diagnostics
 for update
 to authenticated
-using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'))
-with check ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role in ('admin', 'super_admin')))
+with check ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role in ('admin', 'super_admin')));
 
 drop policy if exists "Users can delete own diagnostics" on public.user_diagnostics;
 create policy "Users can delete own diagnostics"
 on public.user_diagnostics
 for delete
 to authenticated
-using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role in ('admin', 'super_admin')));
 
 alter table public.time_simulations enable row level security;
 
@@ -173,7 +177,7 @@ create policy "Users can read own time simulations"
 on public.time_simulations
 for select
 to authenticated
-using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role in ('admin', 'super_admin')));
 
 drop policy if exists "Users can insert own time simulations" on public.time_simulations;
 create policy "Users can insert own time simulations"
@@ -187,12 +191,12 @@ create policy "Users can update own time simulations"
 on public.time_simulations
 for update
 to authenticated
-using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'))
-with check ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role in ('admin', 'super_admin')))
+with check ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role in ('admin', 'super_admin')));
 
 drop policy if exists "Users can delete own time simulations" on public.time_simulations;
 create policy "Users can delete own time simulations"
 on public.time_simulations
 for delete
 to authenticated
-using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role = 'admin'));
+using ((select auth.uid()) = user_id or exists (select 1 from public.users u where u.id = (select auth.uid()) and u.role in ('admin', 'super_admin')));

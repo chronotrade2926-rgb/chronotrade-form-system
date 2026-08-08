@@ -3,7 +3,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(__dirname, "public");
@@ -12,6 +12,8 @@ const quotesDir = join(dataDir, "quotes");
 const prospectsPath = join(dataDir, "prospects.json");
 const outboxPath = join(dataDir, "email-outbox.json");
 const followupsPath = join(dataDir, "followups.json");
+const ordersPath = join(dataDir, "orders.json");
+const productIntakesPath = join(dataDir, "product-intakes.json");
 
 const PORT = Number(process.env.PORT || 3030);
 const PUBLIC_BASE_URL = cleanUrl(process.env.PUBLIC_BASE_URL || "");
@@ -21,6 +23,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
 const STRIPE_ANALYSE_EXPRESS_PRICE_ID = process.env.STRIPE_ANALYSE_EXPRESS_PRICE_ID || "";
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const GOOGLE_BUSINESS_REVIEW_URL = process.env.GOOGLE_BUSINESS_REVIEW_URL || "";
 const GOOGLE_BUSINESS_PROFILE_URL = process.env.GOOGLE_BUSINESS_PROFILE_URL || "";
 const GOOGLE_BUSINESS_ACCOUNT_ID = process.env.GOOGLE_BUSINESS_ACCOUNT_ID || "";
@@ -28,6 +31,7 @@ const GOOGLE_BUSINESS_LOCATION_ID = process.env.GOOGLE_BUSINESS_LOCATION_ID || "
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || "";
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || "";
 let graphTokenCache = null;
 
 const companyProfile = {
@@ -54,6 +58,7 @@ const serviceLabels = {
   site_web: "Site web",
   automatisation_ia: "Automatisation IA",
   branding: "Branding",
+  motion: "ChronoTrade Motion",
   application_web: "Application web",
   demande_generale: "Demande generale"
 };
@@ -79,6 +84,10 @@ const formSchemas = {
     required: ["firstName", "lastName", "email", "company", "brandNeed", "targetAudience", "styleDirection", "budget", "deadline"],
     fields: ["existingBrand", "deliverables", "competitors", "usageChannels"]
   },
+  motion: {
+    required: ["firstName", "lastName", "email", "motionType", "contentGoal", "platform", "format", "budget", "deadline"],
+    fields: ["company", "phone", "brandAssets", "duration", "references", "variants", "message"]
+  },
   application_web: {
     required: ["firstName", "lastName", "email", "company", "appGoal", "userTypes", "coreFeatures", "budget", "deadline"],
     fields: ["authNeeded", "paymentsNeeded", "adminNeeded", "integrations", "hostingPreference"]
@@ -97,6 +106,7 @@ const serviceMinimums = {
   site_web: 900,
   automatisation_ia: 850,
   branding: 650,
+  motion: 149,
   application_web: 2800,
   demande_generale: 600
 };
@@ -152,6 +162,16 @@ const quotePresets = {
       ["Declinaisons pour supports digitaux", 250]
     ]
   },
+  motion: {
+    title: "ChronoTrade Motion",
+    duration: "3 a 10 jours selon le format",
+    items: [
+      ["Cadrage du message, accroche et objectif", 75],
+      ["Direction visuelle et rythme de la sequence", 125],
+      ["Creation motion, animation ou montage court", 180],
+      ["Export optimise pour la plateforme choisie", 70]
+    ]
+  },
   application_web: {
     title: "Application web sur mesure",
     duration: "4 a 8 semaines",
@@ -188,7 +208,7 @@ function corsHeaders() {
   return {
     "access-control-allow-origin": SITE_ORIGIN,
     "access-control-allow-methods": "GET,POST,PATCH,OPTIONS",
-    "access-control-allow-headers": "content-type,accept",
+    "access-control-allow-headers": "content-type,accept,x-admin-key,stripe-signature",
     "vary": "Origin"
   };
 }
@@ -224,6 +244,12 @@ async function readRequestBody(req) {
     return parseMultipart(raw, boundary);
   }
   return {};
+}
+
+async function readRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
 }
 
 function parseMultipart(raw, boundary) {
@@ -518,15 +544,107 @@ function mapLiveStudioForm(fields) {
   return { service, answers: base };
 }
 
+function mapLiveMotionForm(fields) {
+  const name = splitName(fields.nom);
+  const motionType = cleanString(fields.type_creation || fields.objectif);
+  const contentGoal = cleanString(fields.objectif_contenu || fields.message);
+  const platform = cleanString(fields.plateforme);
+  const format = cleanString(fields.format);
+  const pack = cleanString(fields.pack_motion);
+  return {
+    service: "motion",
+    answers: {
+      ...name,
+      email: fields.email,
+      phone: fields.telephone,
+      company: fields.entreprise || "Non precise",
+      requestTopic: `ChronoTrade Motion - ${motionType || "Creation courte"}`,
+      motionType: motionType || "A qualifier",
+      contentGoal: contentGoal || "A qualifier",
+      platform: platform || "A definir",
+      format: format || "A definir",
+      brandAssets: fields.elements_marque || "A confirmer",
+      duration: fields.duree_souhaitee || "Courte",
+      references: fields.references || fields.inspiration,
+      variants: fields.variantes || pack || "A definir",
+      budget: fields.budget,
+      deadline: fields.delai,
+      message: [
+        pack && `Pack demande : ${pack}`,
+        contentGoal && `Objectif : ${contentGoal}`,
+        platform && `Plateforme : ${platform}`,
+        format && `Format : ${format}`,
+        fields.message_complementaire && `Infos complementaires : ${fields.message_complementaire}`
+      ].filter(Boolean).join("\n") || fields.message
+    }
+  };
+}
+
+function mapLiveSurMesureForm(fields) {
+  const name = splitName(fields.nom);
+  const need = cleanString(fields.besoin_principal);
+  const description = cleanString(fields.description || fields.message);
+  const serviceMap = {
+    "site-plateforme": "site_web",
+    application: "application_web",
+    "ia-automatisation": "automatisation_ia",
+    "design-identite": "branding",
+    "motion-publicite": "motion",
+    "strategie-lancement": "chronotrade_launch",
+    "je-ne-sais-pas": "demande_generale",
+    autre: "demande_generale"
+  };
+  const service = serviceMap[need] || "demande_generale";
+  const common = {
+    ...name,
+    email: fields.email,
+    phone: fields.telephone,
+    company: fields.entreprise || "Non precise",
+    budget: fields.budget || "A definir",
+    deadline: fields.delai || "A definir",
+    message: [
+      description && `Description : ${description}`,
+      fields.url_actuelle && `URL / reference : ${fields.url_actuelle}`,
+      fields.outils_utilises && `Outils utilises : ${fields.outils_utilises}`,
+      fields.plateforme_format && `Plateforme / format : ${fields.plateforme_format}`,
+      fields.objectif_prioritaire && `Objectif prioritaire : ${fields.objectif_prioritaire}`
+    ].filter(Boolean).join("\n") || description,
+    requestTopic: `Demande sur mesure - ${need || "A qualifier"}`,
+    description
+  };
+
+  if (service === "site_web") {
+    return { service, answers: { ...common, websiteType: "Site / plateforme", mainGoal: description, currentWebsite: fields.url_actuelle, pagesNeeded: "A qualifier", features: description } };
+  }
+  if (service === "application_web") {
+    return { service, answers: { ...common, appGoal: description, userTypes: "A qualifier", coreFeatures: description, integrations: fields.url_actuelle } };
+  }
+  if (service === "automatisation_ia") {
+    return { service, answers: { ...common, processToAutomate: description, toolsUsed: fields.outils_utilises || "A qualifier", volume: "A qualifier", currentPain: description, expectedOutcome: fields.objectif_prioritaire } };
+  }
+  if (service === "branding") {
+    return { service, answers: { ...common, brandNeed: "Design / identite", targetAudience: "A qualifier", styleDirection: description, existingBrand: fields.url_actuelle, deliverables: "A qualifier" } };
+  }
+  if (service === "motion") {
+    return { service, answers: { ...common, motionType: "Publicite / motion", contentGoal: description, platform: fields.plateforme_format || "A definir", format: fields.plateforme_format || "A definir", brandAssets: fields.url_actuelle || "A confirmer" } };
+  }
+  if (service === "chronotrade_launch") {
+    return { service, answers: { ...common, projectIdea: description, stage: "A qualifier", mainBlocker: fields.objectif_prioritaire || "A qualifier", targetCustomer: "A qualifier", launchGoal: description } };
+  }
+  return { service, answers: { ...common, requestTopic: `Demande sur mesure - ${need || "A qualifier"}`, message: common.message || "A qualifier" } };
+}
+
 function mapLiveFormByKind(kind, fields) {
   const mappers = {
     devis: mapLiveDevisForm,
+    "sur-mesure": mapLiveSurMesureForm,
     vision: mapLiveVisionForm,
     launch: mapLiveLaunchForm,
     os: mapLiveOsForm,
     business: mapLiveBusinessForm,
     partner: mapLivePartnerForm,
-    studio: mapLiveStudioForm
+    studio: mapLiveStudioForm,
+    motion: mapLiveMotionForm
   };
   const mapper = mappers[kind];
   if (!mapper) return { service: "", answers: {} };
@@ -672,12 +790,14 @@ function assessComplexity(lead) {
     "connexion", "integration", "api", "automatisation", "agent ia", "ia", "notion",
     "crm", "espace client", "compte utilisateur", "authentification", "base de donnees",
     "multi", "sur mesure", "refonte", "e-commerce", "ecommerce", "reservation",
-    "calendly", "workflow", "relance", "devis", "support client"
+    "calendly", "workflow", "relance", "devis", "support client", "video", "reel",
+    "short", "story", "animation", "logo anime", "publicite", "ads", "variantes"
   ];
   for (const marker of markers) if (text.includes(marker)) score += 1;
 
   if (lead.service === "application_web") score += 5;
   if (lead.service === "automatisation_ia") score += 3;
+  if (lead.service === "motion") score += 1;
   if (lead.service === "site_web") score += 1;
 
   const pageText = normalizeForScoring(lead.answers.pagesNeeded || lead.answers.pageCount || "");
@@ -752,6 +872,7 @@ function quoteAssumptions(lead) {
   if (lead.service === "site_web") base.push("Le tarif inclut une structure responsive et un formulaire de contact.");
   if (lead.service === "chronotrade_vision") base.push("Le tarif inclut une analyse de direction, plusieurs pistes adaptees et une roadmap exploitable.");
   if (lead.service === "automatisation_ia") base.push("Le tarif inclut la construction d'un workflow pilote et ses tests.");
+  if (lead.service === "motion") base.push("Le tarif inclut une creation motion courte, un export adapte au format choisi et une base de message a valider.");
   if (lead.service === "application_web") base.push("Le tarif suppose une premiere version exploitable, pas un produit SaaS complet multi-modules.");
   if (answers.message) base.push(`Point client a garder en tete : ${answers.message}`);
   return base;
@@ -1116,6 +1237,60 @@ async function supabaseInsert(table, payload) {
   };
 }
 
+async function supabaseUpsert(table, payload, onConflict) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    return { enabled: false, message: "Variables Supabase absentes." };
+  }
+
+  const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
+  if (onConflict) url.searchParams.set("on_conflict", onConflict);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "content-type": "application/json",
+      prefer: "resolution=merge-duplicates,return=representation"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+
+  return {
+    enabled: true,
+    ok: response.ok,
+    table,
+    data,
+    message: response.ok ? "Synchronisation Supabase reussie." : text
+  };
+}
+
+async function supabaseUserIdByEmail(email) {
+  const cleanEmail = String(email || "").trim().toLowerCase();
+  if (!cleanEmail || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
+  const url = new URL(`${SUPABASE_URL}/rest/v1/users`);
+  url.searchParams.set("select", "id");
+  url.searchParams.set("email", `eq.${cleanEmail}`);
+  url.searchParams.set("limit", "1");
+  const response = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      accept: "application/json"
+    }
+  });
+  if (!response.ok) return null;
+  const data = await response.json().catch(() => []);
+  return Array.isArray(data) && data[0]?.id ? data[0].id : null;
+}
+
 function fullNameFromLead(lead) {
   return `${lead.answers.firstName || ""} ${lead.answers.lastName || ""}`.trim() || "Prospect ChronoTrade";
 }
@@ -1141,6 +1316,13 @@ function isBusinessLead(lead) {
 
 function isStudioLead(lead) {
   return cleanString(lead.answers.requestTopic).toLowerCase().startsWith("chronotrade studio");
+}
+
+function projectUniverse(lead) {
+  if (lead.service === "chronotrade_launch") return "launch";
+  if (lead.service === "automatisation_ia") return "os";
+  if (lead.service === "motion") return "motion";
+  return "studio";
 }
 
 function slugify(value) {
@@ -1188,12 +1370,12 @@ async function syncSupabase(lead) {
       });
     }
 
-    if (lead.service === "chronotrade_launch" || lead.service === "automatisation_ia" || isStudioLead(lead)) {
+    if (lead.service === "chronotrade_launch" || lead.service === "automatisation_ia" || lead.service === "motion" || isStudioLead(lead)) {
       return await supabaseInsert("projects", {
         title: lead.answers.requestTopic || lead.serviceLabel || "Projet ChronoTrade",
         slug: slugify(`${lead.serviceLabel || lead.service}-${lead.id}`),
         client_name: fullNameFromLead(lead),
-        universe: lead.service === "chronotrade_launch" ? "launch" : lead.service === "automatisation_ia" ? "os" : "studio",
+        universe: projectUniverse(lead),
         category: lead.serviceLabel || lead.service,
         short_description: leadDescription(lead).slice(0, 260),
         problem: lead.answers.mainBlocker || lead.answers.currentPain || lead.answers.imageProblem || "",
@@ -1517,7 +1699,7 @@ async function handleAnalyseExpressCheckout(res) {
     });
   }
 
-  const successUrl = `${SITE_ORIGIN}/contact/?catalogue=analyse-express&paiement=success`;
+  const successUrl = `${SITE_ORIGIN}/analyse-express/?catalogue=analyse-express&paiement=success`;
   const cancelUrl = `${SITE_ORIGIN}/?catalogue=analyse-express&paiement=cancel`;
   const body = new URLSearchParams({
     mode: "payment",
@@ -1584,6 +1766,293 @@ async function createStripeCheckoutSession(body) {
   return { stripeResponse, session };
 }
 
+function verifyStripeWebhookSignature(rawBody, signatureHeader) {
+  if (!STRIPE_WEBHOOK_SECRET) {
+    return { ok: false, message: "STRIPE_WEBHOOK_SECRET absent." };
+  }
+  const parts = Object.fromEntries(String(signatureHeader || "").split(",").map((part) => {
+    const [key, value] = part.split("=");
+    return [key, value];
+  }));
+  if (!parts.t || !parts.v1) return { ok: false, message: "Signature Stripe absente ou invalide." };
+  const signedPayload = `${parts.t}.${rawBody.toString("utf8")}`;
+  const expected = createHmac("sha256", STRIPE_WEBHOOK_SECRET).update(signedPayload).digest("hex");
+  const expectedBuffer = Buffer.from(expected, "hex");
+  const receivedBuffer = Buffer.from(parts.v1, "hex");
+  if (expectedBuffer.length !== receivedBuffer.length || !timingSafeEqual(expectedBuffer, receivedBuffer)) {
+    return { ok: false, message: "Signature Stripe refusee." };
+  }
+  return { ok: true };
+}
+
+function analyseExpressQuestionnaireUrl(sessionId = "") {
+  const url = new URL("/analyse-express/", SITE_ORIGIN);
+  url.searchParams.set("paiement", "success");
+  if (sessionId) url.searchParams.set("session_id", sessionId);
+  return url.toString();
+}
+
+async function fetchStripeSessionDetails(session) {
+  if (!STRIPE_SECRET_KEY || !session?.id) return session || {};
+  const params = new URLSearchParams();
+  params.append("expand[]", "payment_intent.latest_charge");
+  params.append("expand[]", "invoice");
+  try {
+    const response = await fetch(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(session.id)}?${params.toString()}`, {
+      headers: { authorization: `Bearer ${STRIPE_SECRET_KEY}` }
+    });
+    if (!response.ok) return session;
+    const detailedSession = await response.json();
+    return { ...session, ...detailedSession };
+  } catch {
+    return session;
+  }
+}
+
+function orderFromStripeSession(session) {
+  const now = new Date().toISOString();
+  const product = session.metadata?.product || "unknown";
+  const paymentIntent = session.payment_intent || {};
+  const latestCharge = paymentIntent.latest_charge || paymentIntent.charges?.data?.[0] || {};
+  return {
+    id: session.id || randomUUID(),
+    stripeSessionId: session.id || "",
+    stripePaymentIntent: typeof paymentIntent === "string" ? paymentIntent : paymentIntent.id || "",
+    product,
+    productLabel: product === "analyse_express" ? "Analyse Express ChronoTrade" : product,
+    status: session.payment_status === "paid" ? "paid" : session.payment_status || "pending",
+    amount: Number(session.amount_total || 0) / 100,
+    currency: String(session.currency || "eur").toUpperCase(),
+    customerEmail: session.customer_details?.email || session.customer_email || "",
+    customerName: session.customer_details?.name || "",
+    invoiceUrl: session.invoice?.hosted_invoice_url || "",
+    receiptUrl: latestCharge.receipt_url || "",
+    questionnaireUrl: product === "analyse_express" ? analyseExpressQuestionnaireUrl(session.id) : "",
+    raw: {
+      mode: session.mode || "",
+      source: session.metadata?.source || "",
+      invoice: typeof session.invoice === "string" ? session.invoice : session.invoice?.id || "",
+      created: session.created || null
+    },
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+async function upsertLocalOrder(order) {
+  const orders = await readJson(ordersPath, []);
+  const index = orders.findIndex((item) => item.stripeSessionId === order.stripeSessionId || item.id === order.id);
+  if (index >= 0) {
+    orders[index] = { ...orders[index], ...order, createdAt: orders[index].createdAt || order.createdAt, updatedAt: new Date().toISOString() };
+    await writeJson(ordersPath, orders);
+    return orders[index];
+  }
+  orders.unshift(order);
+  await writeJson(ordersPath, orders);
+  return order;
+}
+
+async function syncSupabaseOrder(order) {
+  const userId = await supabaseUserIdByEmail(order.customerEmail);
+  const orderSync = await supabaseUpsert("orders_or_projects", {
+    user_id: userId,
+    service_type: order.productLabel,
+    title: order.productLabel,
+    status: order.status,
+    amount: order.amount,
+    currency: order.currency || "EUR",
+    action_url: order.questionnaireUrl || null,
+    stripe_session_id: order.stripeSessionId || null,
+    stripe_payment_intent: typeof order.stripePaymentIntent === "string" ? order.stripePaymentIntent : order.stripePaymentIntent?.id || null,
+    invoice_url: order.invoiceUrl || null,
+    receipt_url: order.receiptUrl || null,
+    metadata: {
+      customerEmail: order.customerEmail || null,
+      customerName: order.customerName || null,
+      productKey: order.product || null,
+      paymentStatus: order.status || null,
+      stripeSessionId: order.stripeSessionId || null,
+      stripePaymentIntent: typeof order.stripePaymentIntent === "string" ? order.stripePaymentIntent : order.stripePaymentIntent?.id || null,
+      invoiceUrl: order.invoiceUrl || null,
+      receiptUrl: order.receiptUrl || null
+    },
+    created_at: order.createdAt,
+    updated_at: order.updatedAt
+  }, "stripe_session_id");
+  if (userId && order.status === "paid") {
+    const entitlementKey = order.questionnaireUrl || order.stripeSessionId || order.product;
+    const entitlementSync = await supabaseUpsert("entitlements", {
+      user_id: userId,
+      resource_type: order.product || "product",
+      status: "active",
+      access_url: order.questionnaireUrl || null,
+      version: "1",
+      metadata: {
+        label: order.productLabel,
+        stripeSessionId: order.stripeSessionId || null,
+        stripePaymentIntent: typeof order.stripePaymentIntent === "string" ? order.stripePaymentIntent : order.stripePaymentIntent?.id || null,
+        entitlementKey
+      },
+      created_at: order.createdAt,
+      updated_at: order.updatedAt
+    }, "user_id,resource_type,access_url");
+    return { order: orderSync, entitlement: entitlementSync };
+  }
+  return { order: orderSync, entitlement: { skipped: true, reason: userId ? "payment_not_paid" : "user_not_found" } };
+}
+
+function buildOrderClientEmail(order) {
+  return {
+    to: order.customerEmail,
+    subject: "Votre Analyse Express ChronoTrade est confirmee",
+    text: [
+      `Bonjour ${order.customerName || ""}`.trim() + ",",
+      "",
+      "Votre paiement Analyse Express ChronoTrade a bien ete confirme.",
+      "",
+      "Prochaine etape : completez le questionnaire court pour que je puisse analyser votre projet correctement.",
+      order.questionnaireUrl ? `Questionnaire : ${order.questionnaireUrl}` : "",
+      "",
+      "A tres vite,",
+      `${companyProfile.owner} - ${companyProfile.name}`
+    ].filter(Boolean).join("\n")
+  };
+}
+
+function buildOrderInternalEmail(order) {
+  return {
+    to: process.env.INTERNAL_NOTIFICATION_EMAIL || companyProfile.email,
+    subject: `Nouvelle commande ChronoTrade - ${order.productLabel}`,
+    text: [
+      `Produit : ${order.productLabel}`,
+      `Statut : ${order.status}`,
+      `Montant : ${order.amount} ${order.currency}`,
+      `Client : ${order.customerName || "Non renseigne"}`,
+      `Email : ${order.customerEmail || "Non renseigne"}`,
+      order.questionnaireUrl ? `Questionnaire : ${order.questionnaireUrl}` : ""
+    ].filter(Boolean).join("\n")
+  };
+}
+
+async function notifyOrder(order) {
+  const results = { client: { enabled: false }, internal: { enabled: false } };
+  if (order.customerEmail) results.client = await sendViaGraph(buildOrderClientEmail(order));
+  if (process.env.INTERNAL_NOTIFICATION_EMAIL) results.internal = await sendViaGraph(buildOrderInternalEmail(order));
+  await addOutbox([
+    {
+      id: randomUUID(),
+      orderId: order.id,
+      type: "order_client_confirmation",
+      status: results.client.ok ? "sent" : "prepared",
+      sendResult: results.client,
+      createdAt: new Date().toISOString(),
+      ...buildOrderClientEmail(order)
+    },
+    {
+      id: randomUUID(),
+      orderId: order.id,
+      type: "order_internal_notification",
+      status: results.internal.ok ? "sent" : "prepared",
+      sendResult: results.internal,
+      createdAt: new Date().toISOString(),
+      ...buildOrderInternalEmail(order)
+    }
+  ]);
+  return results;
+}
+
+async function handleStripeWebhook(req, res) {
+  try {
+    const rawBody = await readRawBody(req);
+    const signature = req.headers["stripe-signature"];
+    const verification = verifyStripeWebhookSignature(rawBody, signature);
+    if (!verification.ok) return jsonResponse(res, 400, { ok: false, error: verification.message });
+    const event = JSON.parse(rawBody.toString("utf8"));
+    if (event.type !== "checkout.session.completed") {
+      return jsonResponse(res, 200, { ok: true, ignored: event.type });
+    }
+    const detailedSession = await fetchStripeSessionDetails(event.data.object || {});
+    const order = await upsertLocalOrder(orderFromStripeSession(detailedSession));
+    const supabase = await syncSupabaseOrder(order);
+    const notification = order.status === "paid" ? await notifyOrder(order) : { skipped: true };
+    return jsonResponse(res, 200, { ok: true, order, integrations: { supabase, notification } });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+async function handleAnalyseExpressIntake(req, res) {
+  try {
+    const fields = await readRequestBody(req);
+    const now = new Date().toISOString();
+    const intake = {
+      id: randomUUID(),
+      product: "analyse_express",
+      stripeSessionId: cleanString(fields.session_id || fields.stripe_session_id),
+      fullName: cleanString(fields.nom),
+      email: cleanString(fields.email).toLowerCase(),
+      projectUrl: cleanString(fields.url_projet),
+      currentSituation: cleanString(fields.situation),
+      goal: cleanString(fields.objectif),
+      blockers: cleanString(fields.blocages),
+      priority: cleanString(fields.priorite),
+      createdAt: now,
+      updatedAt: now
+    };
+    const intakes = await readJson(productIntakesPath, []);
+    intakes.unshift(intake);
+    await writeJson(productIntakesPath, intakes);
+    const email = {
+      to: process.env.INTERNAL_NOTIFICATION_EMAIL || companyProfile.email,
+      subject: "Questionnaire Analyse Express recu",
+      text: [
+        `Nom : ${intake.fullName}`,
+        `Email : ${intake.email}`,
+        `Session Stripe : ${intake.stripeSessionId || "Non renseignee"}`,
+        `URL / contexte : ${intake.projectUrl || "Non renseigne"}`,
+        "",
+        `Situation : ${intake.currentSituation}`,
+        "",
+        `Objectif : ${intake.goal}`,
+        "",
+        `Blocages : ${intake.blockers}`,
+        "",
+        `Priorite : ${intake.priority}`
+      ].join("\n")
+    };
+    const notification = process.env.INTERNAL_NOTIFICATION_EMAIL ? await sendViaGraph(email) : { enabled: false, message: "Email interne absent." };
+    await addOutbox([{ id: randomUUID(), intakeId: intake.id, type: "analyse_express_intake", status: notification.ok ? "sent" : "prepared", sendResult: notification, createdAt: now, ...email }]);
+    return jsonResponse(res, 201, { ok: true, intake: { id: intake.id }, notification });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+function requireAdminApiKey(req, res) {
+  if (!ADMIN_API_KEY) {
+    jsonResponse(res, 503, { ok: false, error: "ADMIN_API_KEY absent dans Render." });
+    return false;
+  }
+  const received = req.headers["x-admin-key"];
+  if (!received || received !== ADMIN_API_KEY) {
+    jsonResponse(res, 401, { ok: false, error: "Acces admin refuse." });
+    return false;
+  }
+  return true;
+}
+
+async function handleListOrders(req, res) {
+  if (!requireAdminApiKey(req, res)) return;
+  const orders = await readJson(ordersPath, []);
+  jsonResponse(res, 200, { ok: true, orders });
+}
+
+async function handleListProductIntakes(req, res) {
+  if (!requireAdminApiKey(req, res)) return;
+  const intakes = await readJson(productIntakesPath, []);
+  jsonResponse(res, 200, { ok: true, intakes });
+}
+
 async function handleAnalyseExpressEmbeddedCheckout(res) {
   if (!STRIPE_SECRET_KEY || !STRIPE_PUBLISHABLE_KEY) {
     return jsonResponse(res, 503, {
@@ -1595,7 +2064,7 @@ async function handleAnalyseExpressEmbeddedCheckout(res) {
   const body = new URLSearchParams({
     mode: "payment",
     ui_mode: "embedded",
-    return_url: `${SITE_ORIGIN}/?catalogue=analyse-express&paiement=success&session_id={CHECKOUT_SESSION_ID}`,
+    return_url: `${SITE_ORIGIN}/analyse-express/?paiement=success&session_id={CHECKOUT_SESSION_ID}`,
     submit_type: "book",
     "metadata[product]": "analyse_express",
     "metadata[source]": "chronotrade_catalogue_embedded"
@@ -1760,6 +2229,8 @@ async function ensureDataFiles() {
   if (!existsSync(prospectsPath)) await writeJson(prospectsPath, []);
   if (!existsSync(outboxPath)) await writeJson(outboxPath, []);
   if (!existsSync(followupsPath)) await writeJson(followupsPath, []);
+  if (!existsSync(ordersPath)) await writeJson(ordersPath, []);
+  if (!existsSync(productIntakesPath)) await writeJson(productIntakesPath, []);
 }
 
 await ensureDataFiles();
@@ -1772,17 +2243,23 @@ createServer((req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/leads") return handleLead(req, res);
   if (req.method === "POST" && url.pathname === "/api/forms/devis") return handleLiveForm(req, res, "devis");
+  if (req.method === "POST" && url.pathname === "/api/forms/sur-mesure") return handleLiveForm(req, res, "sur-mesure");
   if (req.method === "POST" && url.pathname === "/api/forms/vision") return handleLiveForm(req, res, "vision");
   if (req.method === "POST" && url.pathname === "/api/forms/launch") return handleLiveForm(req, res, "launch");
   if (req.method === "POST" && url.pathname === "/api/forms/os") return handleLiveForm(req, res, "os");
   if (req.method === "POST" && url.pathname === "/api/forms/business") return handleLiveForm(req, res, "business");
   if (req.method === "POST" && url.pathname === "/api/forms/partner") return handleLiveForm(req, res, "partner");
   if (req.method === "POST" && url.pathname === "/api/forms/studio") return handleLiveForm(req, res, "studio");
+  if (req.method === "POST" && url.pathname === "/api/forms/motion") return handleLiveForm(req, res, "motion");
   if (req.method === "GET" && url.pathname === "/api/leads") return handleListLeads(res);
   if (req.method === "GET" && url.pathname === "/api/config/public") return handlePublicConfig(res);
   if (req.method === "GET" && url.pathname === "/api/google-reviews") return handleGoogleReviews(res);
   if (req.method === "GET" && url.pathname === "/api/checkout/analyse-express") return handleAnalyseExpressCheckout(res);
   if (req.method === "POST" && url.pathname === "/api/checkout/analyse-express/session") return handleAnalyseExpressEmbeddedCheckout(res);
+  if (req.method === "POST" && url.pathname === "/api/stripe/webhook") return handleStripeWebhook(req, res);
+  if (req.method === "POST" && url.pathname === "/api/orders/analyse-express/intake") return handleAnalyseExpressIntake(req, res);
+  if (req.method === "GET" && url.pathname === "/api/orders") return handleListOrders(req, res);
+  if (req.method === "GET" && url.pathname === "/api/product-intakes") return handleListProductIntakes(req, res);
   if (req.method === "GET" && url.pathname === "/api/followups/due") return handleDueFollowups(res);
   if (req.method === "POST" && url.pathname === "/api/followups/run") return handleRunFollowups(res);
   if (req.method === "GET" && url.pathname.startsWith("/api/leads/") && url.pathname.endsWith("/quote")) {
