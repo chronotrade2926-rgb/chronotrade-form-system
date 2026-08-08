@@ -2091,6 +2091,25 @@ function handlePublicConfig(res) {
   });
 }
 
+function handleHealth(res) {
+  jsonResponse(res, 200, {
+    ok: true,
+    service: "chronotrade-form-system",
+    version: "phase-5-account-commerce",
+    checkedAt: new Date().toISOString(),
+    integrations: {
+      stripePublicKey: Boolean(STRIPE_PUBLISHABLE_KEY),
+      stripeSecretKey: Boolean(STRIPE_SECRET_KEY),
+      stripeWebhookSecret: Boolean(STRIPE_WEBHOOK_SECRET),
+      googleReviewUrl: Boolean(GOOGLE_BUSINESS_REVIEW_URL),
+      googleProfileUrl: Boolean(GOOGLE_BUSINESS_PROFILE_URL),
+      supabaseUrl: Boolean(SUPABASE_URL),
+      supabaseServiceRole: Boolean(SUPABASE_SERVICE_ROLE_KEY),
+      outlookGraph: Boolean(MS_CLIENT_ID && MS_CLIENT_SECRET && MS_REFRESH_TOKEN)
+    }
+  });
+}
+
 async function fetchGoogleAccessToken() {
   const body = new URLSearchParams({
     client_id: GOOGLE_CLIENT_ID,
@@ -2251,6 +2270,7 @@ createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/api/forms/partner") return handleLiveForm(req, res, "partner");
   if (req.method === "POST" && url.pathname === "/api/forms/studio") return handleLiveForm(req, res, "studio");
   if (req.method === "POST" && url.pathname === "/api/forms/motion") return handleLiveForm(req, res, "motion");
+  if (req.method === "GET" && url.pathname === "/api/health") return handleHealth(res);
   if (req.method === "GET" && url.pathname === "/api/leads") return handleListLeads(res);
   if (req.method === "GET" && url.pathname === "/api/config/public") return handlePublicConfig(res);
   if (req.method === "GET" && url.pathname === "/api/google-reviews") return handleGoogleReviews(res);
