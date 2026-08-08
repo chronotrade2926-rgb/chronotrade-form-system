@@ -1968,14 +1968,24 @@ async function handleStripeWebhook(req, res) {
     const verification = verifyStripeWebhookSignature(rawBody, signature);
     if (!verification.ok) return jsonResponse(res, 400, { ok: false, error: verification.message });
     const event = JSON.parse(rawBody.toString("utf8"));
-    if (event.type !== "checkout.session.completed") {
+    const supportedEvents = new Set([
+      "checkout.session.completed",
+      "checkout.session.async_payment_succeeded",
+      "checkout.session.async_payment_failed",
+      "checkout.session.expired"
+    ]);
+    if (!supportedEvents.has(event.type)) {
       return jsonResponse(res, 200, { ok: true, ignored: event.type });
     }
     const detailedSession = await fetchStripeSessionDetails(event.data.object || {});
-    const order = await upsertLocalOrder(orderFromStripeSession(detailedSession));
+    const normalizedOrder = orderFromStripeSession(detailedSession);
+    if (event.type === "checkout.session.async_payment_succeeded") normalizedOrder.status = "paid";
+    if (event.type === "checkout.session.async_payment_failed") normalizedOrder.status = "failed";
+    if (event.type === "checkout.session.expired") normalizedOrder.status = "expired";
+    const order = await upsertLocalOrder(normalizedOrder);
     const supabase = await syncSupabaseOrder(order);
     const notification = order.status === "paid" ? await notifyOrder(order) : { skipped: true };
-    return jsonResponse(res, 200, { ok: true, order, integrations: { supabase, notification } });
+    return jsonResponse(res, 200, { ok: true, event: event.type, order, integrations: { supabase, notification } });
   } catch (error) {
     return jsonResponse(res, 500, { ok: false, error: error.message });
   }
