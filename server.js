@@ -2105,7 +2105,7 @@ function handleHealth(res) {
       googleProfileUrl: Boolean(GOOGLE_BUSINESS_PROFILE_URL),
       supabaseUrl: Boolean(SUPABASE_URL),
       supabaseServiceRole: Boolean(SUPABASE_SERVICE_ROLE_KEY),
-      outlookGraph: Boolean(MS_CLIENT_ID && MS_CLIENT_SECRET && MS_REFRESH_TOKEN)
+      outlookGraph: Boolean(process.env.MICROSOFT_GRAPH_TOKEN || (process.env.MICROSOFT_CLIENT_ID && process.env.MICROSOFT_REFRESH_TOKEN))
     }
   });
 }
