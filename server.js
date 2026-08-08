@@ -2472,6 +2472,7 @@ async function orderFromStripeSession(session) {
     productId: dbProduct?.id || session.metadata?.product_id || null,
     productSlug: dbProduct?.slug || product,
     productVersion: dbProduct?.current_version || "1.0",
+    userId: session.metadata?.user_id || "",
     productLabel: dbProduct?.title || (product === "analyse_express" || product === "analyse-express" ? "Analyse Express ChronoTrade" : product),
     deliveryType: dbProduct?.delivery_type || session.metadata?.delivery_type || "",
     status,
@@ -2514,7 +2515,7 @@ async function upsertLocalOrder(order) {
 }
 
 async function syncSupabaseOrder(order) {
-  const userId = await supabaseUserIdByEmail(order.customerEmail);
+  const userId = order.userId || await supabaseUserIdByEmail(order.customerEmail);
   const orderSync = await supabaseUpsert("orders_or_projects", {
     user_id: userId,
     product_id: order.productId || null,
@@ -2543,6 +2544,7 @@ async function syncSupabaseOrder(order) {
       productSlug: order.productSlug || null,
       deliveryType: order.deliveryType || null,
       productVersion: order.productVersion || null,
+      userId: userId || null,
       paymentStatus: order.status || null,
       stripeSessionId: order.stripeSessionId || null,
       stripePaymentIntent: typeof order.stripePaymentIntent === "string" ? order.stripePaymentIntent : order.stripePaymentIntent?.id || null,
