@@ -208,7 +208,7 @@ function corsHeaders() {
   return {
     "access-control-allow-origin": SITE_ORIGIN,
     "access-control-allow-methods": "GET,POST,PATCH,OPTIONS",
-    "access-control-allow-headers": "content-type,accept,x-admin-key,stripe-signature",
+    "access-control-allow-headers": "content-type,accept,authorization,x-admin-key,stripe-signature",
     "vary": "Origin"
   };
 }
@@ -1291,6 +1291,330 @@ async function supabaseUserIdByEmail(email) {
   return Array.isArray(data) && data[0]?.id ? data[0].id : null;
 }
 
+async function supabaseSelect(table, params = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    return { enabled: false, ok: false, message: "Variables Supabase absentes." };
+  }
+  const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null) url.searchParams.set(key, value);
+  });
+  const response = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      accept: "application/json"
+    }
+  });
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  return { enabled: true, ok: response.ok, status: response.status, table, data, message: response.ok ? "Lecture Supabase reussie." : text };
+}
+
+async function supabaseUpdate(table, payload, filters = {}, options = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    return { enabled: false, ok: false, message: "Variables Supabase absentes." };
+  }
+  const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
+  Object.entries(filters).forEach(([key, value]) => url.searchParams.set(key, value));
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "content-type": "application/json",
+      prefer: options.returnRepresentation === false ? "return=minimal" : "return=representation"
+    },
+    body: JSON.stringify(payload)
+  });
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  return { enabled: true, ok: response.ok, status: response.status, table, data, message: response.ok ? "Mise a jour Supabase reussie." : text };
+}
+
+async function supabaseProductBySlugOrId({ slug, productId, stripePriceId }) {
+  const select = "id,title,slug,short_description,description,product_type,delivery_type,price_cents,currency,stripe_product_id,stripe_price_id,stripe_price_amount,stripe_price_currency,stripe_price_active,stripe_last_sync_at,stripe_sync_error,pricing_model,availability,status,checkout_url,form_url,current_version,delivery_config,email_config,metadata";
+  if (productId) {
+    const result = await supabaseSelect("products", { select, id: `eq.${productId}`, limit: "1" });
+    return result.ok && Array.isArray(result.data) ? result.data[0] || null : null;
+  }
+  if (stripePriceId) {
+    const result = await supabaseSelect("products", { select, stripe_price_id: `eq.${stripePriceId}`, limit: "1" });
+    return result.ok && Array.isArray(result.data) ? result.data[0] || null : null;
+  }
+  if (slug) {
+    const result = await supabaseSelect("products", { select, slug: `eq.${slug}`, limit: "1" });
+    return result.ok && Array.isArray(result.data) ? result.data[0] || null : null;
+  }
+  return null;
+}
+
+async function supabaseAuthUser(req) {
+  const header = req.headers.authorization || req.headers.Authorization || "";
+  const token = String(header).startsWith("Bearer ") ? String(header).slice(7).trim() : "";
+  if (!token || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${token}`,
+      accept: "application/json"
+    }
+  });
+  if (!response.ok) return null;
+  return response.json().catch(() => null);
+}
+
+async function requireSupabaseAdmin(req, res) {
+  const user = await supabaseAuthUser(req);
+  if (!user?.id) {
+    jsonResponse(res, 401, { ok: false, error: "Connexion admin requise." });
+    return null;
+  }
+  const role = await supabaseSelect("users", { select: "id,email,role", id: `eq.${user.id}`, limit: "1" });
+  const profile = role.ok && Array.isArray(role.data) ? role.data[0] : null;
+  if (!["admin", "super_admin"].includes(profile?.role)) {
+    jsonResponse(res, 403, { ok: false, error: "Acces super-admin requis." });
+    return null;
+  }
+  return { user, profile };
+}
+
+async function stripeRequest(path, { method = "GET", body } = {}) {
+  if (!STRIPE_SECRET_KEY) throw new Error("STRIPE_SECRET_KEY absente dans Render.");
+  const response = await fetch(`https://api.stripe.com${path}`, {
+    method,
+    headers: {
+      authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+      ...(body ? { "content-type": "application/x-www-form-urlencoded" } : {})
+    },
+    body
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error?.message || `Erreur Stripe ${response.status}`);
+  return data;
+}
+
+function stripeParams(input = {}) {
+  const params = new URLSearchParams();
+  Object.entries(input).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") params.set(key, String(value));
+  });
+  return params;
+}
+
+function productAmountCents(product) {
+  const amount = product?.price_cents ?? product?.stripe_price_amount;
+  return Number.isFinite(Number(amount)) ? Number(amount) : null;
+}
+
+function isPaidProduct(product) {
+  const amount = productAmountCents(product);
+  return amount !== null && amount > 0;
+}
+
+function productAccessUrl(product, sessionId = "") {
+  if (product?.delivery_type === "questionnaire" || product?.slug === "analyse-express") return analyseExpressQuestionnaireUrl(sessionId);
+  if (product?.delivery_config?.access_url) return product.delivery_config.access_url;
+  return `${SITE_ORIGIN}/dashboard/bibliotheque/`;
+}
+
+async function activeProductFile(productId) {
+  if (!productId) return null;
+  const result = await supabaseSelect("product_media", {
+    select: "id,media_type,url,storage_bucket,storage_path,is_private,version,file_name,mime_type",
+    product_id: `eq.${productId}`,
+    is_private: "eq.true",
+    order: "sort_order.asc,created_at.desc",
+    limit: "1"
+  });
+  return result.ok && Array.isArray(result.data) ? result.data[0] || null : null;
+}
+
+async function syncProductWithStripe(product, reason = "manual_sync") {
+  if (!product?.id) throw new Error("Produit introuvable.");
+  if (!isPaidProduct(product)) {
+    await supabaseUpdate("products", {
+      stripe_price_active: false,
+      stripe_sync_error: null,
+      stripe_last_sync_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    }, { id: `eq.${product.id}` });
+    return { product, stripeProduct: null, stripePrice: null, skipped: "free_or_quote_product" };
+  }
+  if (product.status === "archived") throw new Error("Produit archive : achat impossible.");
+  const amount = productAmountCents(product);
+  const currency = String(product.currency || "EUR").toLowerCase();
+  let stripeProductId = product.stripe_product_id || "";
+  try {
+    if (!stripeProductId) {
+      const stripeProduct = await stripeRequest("/v1/products", {
+        method: "POST",
+        body: stripeParams({
+          name: product.title,
+          description: product.short_description || product.description || "",
+          "metadata[chronotrade_product_id]": product.id,
+          "metadata[chronotrade_slug]": product.slug,
+          "metadata[source]": "chronotrade_super_admin"
+        })
+      });
+      stripeProductId = stripeProduct.id;
+    } else {
+      await stripeRequest(`/v1/products/${encodeURIComponent(stripeProductId)}`, {
+        method: "POST",
+        body: stripeParams({
+          name: product.title,
+          description: product.short_description || product.description || "",
+          "metadata[chronotrade_product_id]": product.id,
+          "metadata[chronotrade_slug]": product.slug
+        })
+      });
+    }
+
+    const priceMatches = product.stripe_price_id
+      && Number(product.stripe_price_amount || product.price_cents) === amount
+      && String(product.stripe_price_currency || product.currency || "EUR").toLowerCase() === currency;
+    let stripePriceId = priceMatches ? product.stripe_price_id : "";
+    let previousStripePriceId = priceMatches ? "" : product.stripe_price_id || "";
+    if (!stripePriceId) {
+      const price = await stripeRequest("/v1/prices", {
+        method: "POST",
+        body: stripeParams({
+          unit_amount: amount,
+          currency,
+          product: stripeProductId,
+          "metadata[chronotrade_product_id]": product.id,
+          "metadata[chronotrade_slug]": product.slug,
+          "metadata[chronotrade_price_cents]": amount,
+          "metadata[source]": "chronotrade_super_admin"
+        })
+      });
+      stripePriceId = price.id;
+      if (previousStripePriceId) {
+        await stripeRequest(`/v1/prices/${encodeURIComponent(previousStripePriceId)}`, {
+          method: "POST",
+          body: stripeParams({ active: "false" })
+        }).catch(() => null);
+      }
+    }
+
+    const syncAt = new Date().toISOString();
+    await supabaseUpdate("products", {
+      stripe_product_id: stripeProductId,
+      stripe_price_id: stripePriceId,
+      stripe_price_active: true,
+      stripe_price_amount: amount,
+      stripe_price_currency: String(product.currency || "EUR").toUpperCase(),
+      stripe_last_sync_at: syncAt,
+      stripe_sync_error: null,
+      checkout_url: `/api/checkout/session?slug=${product.slug}`,
+      updated_at: syncAt
+    }, { id: `eq.${product.id}` });
+    await supabaseInsert("product_price_history", {
+      product_id: product.id,
+      stripe_product_id: stripeProductId,
+      stripe_price_id: stripePriceId,
+      previous_stripe_price_id: previousStripePriceId || null,
+      amount_cents: amount,
+      currency: String(product.currency || "EUR").toUpperCase(),
+      pricing_model: product.pricing_model || "one_time",
+      reason,
+      metadata: { slug: product.slug, title: product.title }
+    });
+    return {
+      product: { ...product, stripe_product_id: stripeProductId, stripe_price_id: stripePriceId, stripe_price_amount: amount, stripe_price_currency: String(product.currency || "EUR").toUpperCase() },
+      stripeProduct: stripeProductId,
+      stripePrice: stripePriceId
+    };
+  } catch (error) {
+    await supabaseUpdate("products", {
+      stripe_sync_error: error.message,
+      stripe_price_active: false,
+      updated_at: new Date().toISOString()
+    }, { id: `eq.${product.id}` }, { returnRepresentation: false });
+    throw error;
+  }
+}
+
+async function validPromotionForProduct(code, product, customerEmail = "") {
+  const cleanCode = String(code || "").trim().toUpperCase();
+  if (!cleanCode) return null;
+  const now = new Date().toISOString();
+  const result = await supabaseSelect("promotions", {
+    select: "*",
+    code: `eq.${cleanCode}`,
+    status: "eq.active",
+    limit: "1"
+  });
+  const promo = result.ok && Array.isArray(result.data) ? result.data[0] : null;
+  if (!promo) return null;
+  if (promo.product_id && promo.product_id !== product.id) return null;
+  if (promo.starts_at && promo.starts_at > now) return null;
+  if (promo.ends_at && promo.ends_at < now) return null;
+  const max = Number(promo.max_redemptions || 0);
+  if (max > 0) {
+    const redemptions = await supabaseSelect("promotion_redemptions", { select: "id", promotion_id: `eq.${promo.id}` });
+    if (redemptions.ok && Array.isArray(redemptions.data) && redemptions.data.length >= max) return null;
+  }
+  const amount = productAmountCents(product) || 0;
+  const value = Number(promo.discount_value || 0);
+  const discountCents = promo.discount_type === "fixed"
+    ? Math.min(amount, Math.round(value * 100))
+    : Math.min(amount, Math.round(amount * (value / 100)));
+  return { ...promo, discount_cents: Math.max(0, discountCents), customer_email: customerEmail };
+}
+
+async function syncPromotionWithStripe(promotion, product) {
+  if (!promotion?.id) return null;
+  if (promotion.stripe_promotion_code_id) return promotion;
+  const currency = String(product.currency || "EUR").toLowerCase();
+  const value = Number(promotion.discount_value || 0);
+  const couponParams = {
+    name: promotion.label || promotion.code,
+    duration: "once",
+    "metadata[chronotrade_promotion_id]": promotion.id,
+    "metadata[chronotrade_code]": promotion.code || "",
+    "metadata[chronotrade_product_id]": product.id || ""
+  };
+  if (promotion.discount_type === "fixed") {
+    couponParams.amount_off = Math.round(value * 100);
+    couponParams.currency = currency;
+  } else {
+    couponParams.percent_off = Math.max(1, Math.min(100, value));
+  }
+  const coupon = await stripeRequest("/v1/coupons", {
+    method: "POST",
+    body: stripeParams(couponParams)
+  });
+  const promoCode = await stripeRequest("/v1/promotion_codes", {
+    method: "POST",
+    body: stripeParams({
+      coupon: coupon.id,
+      code: promotion.code,
+      active: "true",
+      max_redemptions: promotion.max_redemptions || "",
+      expires_at: promotion.ends_at ? Math.floor(new Date(promotion.ends_at).getTime() / 1000) : "",
+      "metadata[chronotrade_promotion_id]": promotion.id,
+      "metadata[chronotrade_product_id]": product.id || ""
+    })
+  });
+  await supabaseUpdate("promotions", {
+    stripe_coupon_id: coupon.id,
+    stripe_promotion_code_id: promoCode.id,
+    updated_at: new Date().toISOString()
+  }, { id: `eq.${promotion.id}` });
+  return { ...promotion, stripe_coupon_id: coupon.id, stripe_promotion_code_id: promoCode.id };
+}
+
 function fullNameFromLead(lead) {
   return `${lead.answers.firstName || ""} ${lead.answers.lastName || ""}`.trim() || "Prospect ChronoTrade";
 }
@@ -1691,6 +2015,149 @@ async function handleRunFollowups(res) {
   jsonResponse(res, 200, { ok: true, results });
 }
 
+async function dynamicCheckoutBody(fields = {}, options = {}) {
+  if (!STRIPE_SECRET_KEY || !STRIPE_PUBLISHABLE_KEY) {
+    return {
+      errorStatus: 503,
+      error: "Stripe n'est pas encore configure. Ajoute STRIPE_SECRET_KEY et STRIPE_PUBLISHABLE_KEY dans Render."
+    };
+  }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    return {
+      errorStatus: 503,
+      error: "Supabase n'est pas encore relie a Render. Ajoute SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY."
+    };
+  }
+
+  const product = await supabaseProductBySlugOrId({
+    slug: cleanString(fields.slug || options.slug),
+    productId: cleanString(fields.product_id || fields.productId || options.productId)
+  });
+  if (!product) return { errorStatus: 404, error: "Produit introuvable." };
+  if (product.status !== "published") return { errorStatus: 409, error: "Ce produit n'est pas disponible a l'achat." };
+  if (["archived", "unavailable"].includes(String(product.availability || "").toLowerCase())) {
+    return { errorStatus: 409, error: "Ce produit est actuellement indisponible." };
+  }
+  if (!isPaidProduct(product)) {
+    return {
+      free: true,
+      product,
+      accessUrl: productAccessUrl(product)
+    };
+  }
+
+  const sync = await syncProductWithStripe(product, "checkout");
+  const syncedProduct = sync.product;
+  const requestedPromotionCode = fields.promotion_code || fields.promo || "";
+  let promotion = await validPromotionForProduct(requestedPromotionCode, syncedProduct, fields.email);
+  if (requestedPromotionCode && !promotion) {
+    return { errorStatus: 409, error: "Code promo invalide, expire ou non applicable a ce produit." };
+  }
+  if (promotion) promotion = await syncPromotionWithStripe(promotion, syncedProduct);
+  const returnPath = options.returnPath || (syncedProduct.slug === "analyse-express" ? "/analyse-express/" : "/dashboard/bibliotheque/");
+  const returnUrl = new URL(returnPath, SITE_ORIGIN);
+  returnUrl.searchParams.set("paiement", "success");
+  returnUrl.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}");
+
+  const body = new URLSearchParams({
+    mode: "payment",
+    ui_mode: "embedded",
+    return_url: returnUrl.toString(),
+    submit_type: syncedProduct.delivery_type === "questionnaire" ? "book" : "pay",
+    customer_email: cleanString(fields.email || ""),
+    "line_items[0][price]": syncedProduct.stripe_price_id,
+    "line_items[0][quantity]": "1",
+    "metadata[product]": syncedProduct.slug,
+    "metadata[product_id]": syncedProduct.id,
+    "metadata[product_slug]": syncedProduct.slug,
+    "metadata[delivery_type]": syncedProduct.delivery_type || "",
+    "metadata[source]": "chronotrade_dynamic_checkout"
+  });
+  if (!cleanString(fields.email || "")) body.delete("customer_email");
+  if (promotion?.stripe_promotion_code_id) {
+    body.set("discounts[0][promotion_code]", promotion.stripe_promotion_code_id);
+  } else if (!requestedPromotionCode) {
+    body.set("allow_promotion_codes", "true");
+  }
+  if (promotion?.id) {
+    body.set("metadata[promotion_id]", promotion.id);
+    body.set("metadata[promotion_code]", promotion.code || "");
+    body.set("metadata[discount_cents]", String(promotion.discount_cents || 0));
+  }
+
+  const { stripeResponse, session } = await createStripeCheckoutSession(body);
+  if (!stripeResponse.ok || !session.client_secret) {
+    return { errorStatus: 502, error: session.error?.message || "Impossible de creer le paiement Stripe integre." };
+  }
+  return { product: syncedProduct, promotion, session };
+}
+
+async function handleDynamicCheckoutSession(req, res, url) {
+  try {
+    const fields = req.method === "GET" ? Object.fromEntries(url.searchParams.entries()) : await readRequestBody(req);
+    const result = await dynamicCheckoutBody(fields);
+    if (result.error) return jsonResponse(res, result.errorStatus || 500, { ok: false, error: result.error });
+    if (result.free) {
+      return jsonResponse(res, 200, {
+        ok: true,
+        free: true,
+        product: { id: result.product.id, slug: result.product.slug, title: result.product.title },
+        accessUrl: result.accessUrl
+      });
+    }
+    return jsonResponse(res, 200, {
+      ok: true,
+      id: result.session.id,
+      clientSecret: result.session.client_secret,
+      product: {
+        id: result.product.id,
+        slug: result.product.slug,
+        title: result.product.title,
+        price_cents: result.product.price_cents,
+        currency: result.product.currency
+      },
+      promotion: result.promotion ? { code: result.promotion.code, discount_cents: result.promotion.discount_cents } : null
+    });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+async function handleDynamicCheckoutRedirect(res, url) {
+  if (!STRIPE_SECRET_KEY) {
+    return jsonResponse(res, 503, { ok: false, error: "Stripe n'est pas encore configure. Ajoute STRIPE_SECRET_KEY dans Render." });
+  }
+  try {
+    const product = await supabaseProductBySlugOrId({ slug: cleanString(url.searchParams.get("slug")), productId: cleanString(url.searchParams.get("product_id")) });
+    if (!product) return jsonResponse(res, 404, { ok: false, error: "Produit introuvable." });
+    if (product.status !== "published" || !isPaidProduct(product)) return jsonResponse(res, 409, { ok: false, error: "Produit non achetable directement." });
+    const sync = await syncProductWithStripe(product, "checkout_redirect");
+    const successUrl = `${SITE_ORIGIN}/dashboard/bibliotheque/?paiement=success&session_id={CHECKOUT_SESSION_ID}`;
+    const cancelUrl = `${SITE_ORIGIN}/catalogue/?paiement=cancel&slug=${encodeURIComponent(product.slug)}`;
+    const body = new URLSearchParams({
+      mode: "payment",
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      "line_items[0][price]": sync.product.stripe_price_id,
+      "line_items[0][quantity]": "1",
+      "allow_promotion_codes": "true",
+      "metadata[product]": sync.product.slug,
+      "metadata[product_id]": sync.product.id,
+      "metadata[product_slug]": sync.product.slug,
+      "metadata[delivery_type]": sync.product.delivery_type || "",
+      "metadata[source]": "chronotrade_dynamic_checkout_redirect"
+    });
+    const { stripeResponse, session } = await createStripeCheckoutSession(body);
+    if (!stripeResponse.ok || !session.url) {
+      return jsonResponse(res, 502, { ok: false, error: session.error?.message || "Impossible de creer le paiement Stripe." });
+    }
+    res.writeHead(303, { location: session.url, ...corsHeaders() });
+    res.end();
+  } catch (error) {
+    jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
 async function handleAnalyseExpressCheckout(res) {
   if (!STRIPE_SECRET_KEY) {
     return jsonResponse(res, 503, {
@@ -1797,10 +2264,19 @@ async function fetchStripeSessionDetails(session) {
   const params = new URLSearchParams();
   params.append("expand[]", "payment_intent.latest_charge");
   params.append("expand[]", "invoice");
+  params.append("expand[]", "line_items.data.price.product");
   try {
-    const response = await fetch(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(session.id)}?${params.toString()}`, {
+    let response = await fetch(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(session.id)}?${params.toString()}`, {
       headers: { authorization: `Bearer ${STRIPE_SECRET_KEY}` }
     });
+    if (!response.ok) {
+      params.delete("expand[]");
+      params.append("expand[]", "payment_intent.latest_charge");
+      params.append("expand[]", "invoice");
+      response = await fetch(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(session.id)}?${params.toString()}`, {
+        headers: { authorization: `Bearer ${STRIPE_SECRET_KEY}` }
+      });
+    }
     if (!response.ok) return session;
     const detailedSession = await response.json();
     return { ...session, ...detailedSession };
@@ -1809,30 +2285,50 @@ async function fetchStripeSessionDetails(session) {
   }
 }
 
-function orderFromStripeSession(session) {
+async function orderFromStripeSession(session) {
   const now = new Date().toISOString();
-  const product = session.metadata?.product || "unknown";
+  const firstLine = session.line_items?.data?.[0] || {};
+  const stripePriceId = typeof firstLine.price === "string" ? firstLine.price : firstLine.price?.id || "";
+  const dbProduct = await supabaseProductBySlugOrId({
+    productId: session.metadata?.product_id,
+    slug: session.metadata?.product_slug || session.metadata?.product,
+    stripePriceId
+  });
+  const product = dbProduct?.slug || session.metadata?.product_slug || session.metadata?.product || "unknown";
   const paymentIntent = session.payment_intent || {};
   const latestCharge = paymentIntent.latest_charge || paymentIntent.charges?.data?.[0] || {};
+  const status = session.payment_status === "paid" ? "paid" : session.payment_status || "pending";
+  const accessUrl = productAccessUrl(dbProduct || { slug: product, delivery_type: session.metadata?.delivery_type }, session.id);
   return {
     id: session.id || randomUUID(),
     stripeSessionId: session.id || "",
     stripePaymentIntent: typeof paymentIntent === "string" ? paymentIntent : paymentIntent.id || "",
     product,
-    productLabel: product === "analyse_express" ? "Analyse Express ChronoTrade" : product,
-    status: session.payment_status === "paid" ? "paid" : session.payment_status || "pending",
+    productId: dbProduct?.id || session.metadata?.product_id || null,
+    productSlug: dbProduct?.slug || product,
+    productVersion: dbProduct?.current_version || "1.0",
+    productLabel: dbProduct?.title || (product === "analyse_express" || product === "analyse-express" ? "Analyse Express ChronoTrade" : product),
+    deliveryType: dbProduct?.delivery_type || session.metadata?.delivery_type || "",
+    status,
     amount: Number(session.amount_total || 0) / 100,
+    amountCents: Number(session.amount_total || 0),
+    discountCents: Number(session.metadata?.discount_cents || 0),
     currency: String(session.currency || "eur").toUpperCase(),
     customerEmail: session.customer_details?.email || session.customer_email || "",
     customerName: session.customer_details?.name || "",
     invoiceUrl: session.invoice?.hosted_invoice_url || "",
     receiptUrl: latestCharge.receipt_url || "",
-    questionnaireUrl: product === "analyse_express" ? analyseExpressQuestionnaireUrl(session.id) : "",
+    questionnaireUrl: (dbProduct?.delivery_type === "questionnaire" || product === "analyse_express" || product === "analyse-express") ? analyseExpressQuestionnaireUrl(session.id) : "",
+    accessUrl,
+    stripePriceId,
+    promotionId: session.metadata?.promotion_id || null,
+    promotionCode: session.metadata?.promotion_code || "",
     raw: {
       mode: session.mode || "",
       source: session.metadata?.source || "",
       invoice: typeof session.invoice === "string" ? session.invoice : session.invoice?.id || "",
-      created: session.created || null
+      created: session.created || null,
+      lineItemDescription: firstLine.description || ""
     },
     createdAt: now,
     updatedAt: now
@@ -1856,62 +2352,135 @@ async function syncSupabaseOrder(order) {
   const userId = await supabaseUserIdByEmail(order.customerEmail);
   const orderSync = await supabaseUpsert("orders_or_projects", {
     user_id: userId,
+    product_id: order.productId || null,
+    product_slug: order.productSlug || order.product || null,
+    product_version: order.productVersion || "1.0",
     service_type: order.productLabel,
     title: order.productLabel,
     status: order.status,
     amount: order.amount,
+    amount_cents: order.amountCents || Math.round(Number(order.amount || 0) * 100),
+    discount_cents: order.discountCents || 0,
     currency: order.currency || "EUR",
-    action_url: order.questionnaireUrl || null,
+    action_url: order.questionnaireUrl || order.accessUrl || null,
     stripe_session_id: order.stripeSessionId || null,
     stripe_payment_intent: typeof order.stripePaymentIntent === "string" ? order.stripePaymentIntent : order.stripePaymentIntent?.id || null,
+    stripe_price_id: order.stripePriceId || null,
+    promotion_id: order.promotionId || null,
+    paid_at: order.status === "paid" ? new Date().toISOString() : null,
     invoice_url: order.invoiceUrl || null,
     receipt_url: order.receiptUrl || null,
     metadata: {
       customerEmail: order.customerEmail || null,
       customerName: order.customerName || null,
       productKey: order.product || null,
+      productId: order.productId || null,
+      productSlug: order.productSlug || null,
+      deliveryType: order.deliveryType || null,
+      productVersion: order.productVersion || null,
       paymentStatus: order.status || null,
       stripeSessionId: order.stripeSessionId || null,
       stripePaymentIntent: typeof order.stripePaymentIntent === "string" ? order.stripePaymentIntent : order.stripePaymentIntent?.id || null,
+      stripePriceId: order.stripePriceId || null,
+      promotionCode: order.promotionCode || null,
+      discountCents: order.discountCents || 0,
       invoiceUrl: order.invoiceUrl || null,
       receiptUrl: order.receiptUrl || null
     },
     created_at: order.createdAt,
     updated_at: order.updatedAt
   }, "stripe_session_id");
+  const syncedOrderId = Array.isArray(orderSync.data) ? orderSync.data[0]?.id : orderSync.data?.id;
+  if (order.promotionId && order.stripeSessionId && order.status === "paid") {
+    await supabaseUpsert("promotion_redemptions", {
+      promotion_id: order.promotionId,
+      product_id: order.productId || null,
+      order_id: syncedOrderId || null,
+      user_id: userId,
+      customer_email: order.customerEmail || null,
+      stripe_session_id: order.stripeSessionId,
+      discount_cents: order.discountCents || 0
+    }, "promotion_id,stripe_session_id");
+  }
   if (userId && order.status === "paid") {
-    const entitlementKey = order.questionnaireUrl || order.stripeSessionId || order.product;
+    const privateFile = await activeProductFile(order.productId);
+    const entitlementKey = order.accessUrl || order.questionnaireUrl || order.stripeSessionId || order.product;
     const entitlementSync = await supabaseUpsert("entitlements", {
       user_id: userId,
-      resource_type: order.product || "product",
+      product_id: order.productId || null,
+      order_id: syncedOrderId || null,
+      resource_type: order.productSlug || order.product || "product",
       status: "active",
-      access_url: order.questionnaireUrl || null,
-      version: "1",
+      access_url: order.accessUrl || order.questionnaireUrl || null,
+      version: order.productVersion || privateFile?.version || "1.0",
       metadata: {
         label: order.productLabel,
         stripeSessionId: order.stripeSessionId || null,
         stripePaymentIntent: typeof order.stripePaymentIntent === "string" ? order.stripePaymentIntent : order.stripePaymentIntent?.id || null,
+        productId: order.productId || null,
+        productSlug: order.productSlug || null,
+        deliveryType: order.deliveryType || null,
+        privateFile: privateFile ? {
+          bucket: privateFile.storage_bucket,
+          path: privateFile.storage_path,
+          fileName: privateFile.file_name,
+          version: privateFile.version
+        } : null,
         entitlementKey
       },
       created_at: order.createdAt,
       updated_at: order.updatedAt
     }, "user_id,resource_type,access_url");
+    await scheduleProductFollowupEmail(order, userId, syncedOrderId);
     return { order: orderSync, entitlement: entitlementSync };
   }
   return { order: orderSync, entitlement: { skipped: true, reason: userId ? "payment_not_paid" : "user_not_found" } };
 }
 
+async function scheduleProductFollowupEmail(order, userId, syncedOrderId) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !order.customerEmail || !order.productId) return { skipped: true };
+  const product = await supabaseProductBySlugOrId({ productId: order.productId });
+  const emailConfig = product?.email_config || {};
+  const followupEnabled = emailConfig.followup_enabled !== false;
+  if (!followupEnabled) return { skipped: true };
+  const delayDays = Number(emailConfig.followup_delay_days ?? 4);
+  const scheduledAt = new Date(Date.now() + Math.max(0, delayDays) * 24 * 60 * 60 * 1000).toISOString();
+  return supabaseUpsert("scheduled_emails", {
+    type: "product_review_request",
+    user_id: userId,
+    order_id: syncedOrderId || null,
+    product_id: order.productId,
+    recipient_email: order.customerEmail,
+    subject: emailConfig.followup_subject || `Alors, qu'avez-vous pense de ${order.productLabel} ?`,
+    payload: {
+      productLabel: order.productLabel,
+      productSlug: order.productSlug,
+      googleReviewUrl: GOOGLE_BUSINESS_REVIEW_URL || null,
+      reviewUrl: `${SITE_ORIGIN}/avis/?product=${encodeURIComponent(order.productSlug || order.product || "")}`
+    },
+    scheduled_at: scheduledAt,
+    status: "scheduled",
+    updated_at: new Date().toISOString()
+  }, "order_id,type");
+}
+
 function buildOrderClientEmail(order) {
+  const isAnalyse = order.productSlug === "analyse-express" || order.product === "analyse_express";
+  const accessLabel = isAnalyse ? "Questionnaire" : "Acces";
+  const accessUrl = order.questionnaireUrl || order.accessUrl || `${SITE_ORIGIN}/dashboard/bibliotheque/`;
   return {
     to: order.customerEmail,
-    subject: "Votre Analyse Express ChronoTrade est confirmee",
+    subject: isAnalyse ? "Votre Analyse Express ChronoTrade est confirmee" : `Votre ${order.productLabel} est disponible`,
     text: [
       `Bonjour ${order.customerName || ""}`.trim() + ",",
       "",
-      "Votre paiement Analyse Express ChronoTrade a bien ete confirme.",
+      `Votre paiement pour ${order.productLabel} a bien ete confirme.`,
       "",
-      "Prochaine etape : completez le questionnaire court pour que je puisse analyser votre projet correctement.",
-      order.questionnaireUrl ? `Questionnaire : ${order.questionnaireUrl}` : "",
+      isAnalyse
+        ? "Prochaine etape : completez le questionnaire court pour que je puisse analyser votre projet correctement."
+        : "Votre achat est maintenant rattache a votre espace ChronoTrade.",
+      accessUrl ? `${accessLabel} : ${accessUrl}` : "",
+      !isAnalyse ? "Vous pourrez egalement le retrouver dans : Mon compte -> Bibliotheque." : "",
       "",
       "A tres vite,",
       `${companyProfile.owner} - ${companyProfile.name}`
@@ -1978,7 +2547,7 @@ async function handleStripeWebhook(req, res) {
       return jsonResponse(res, 200, { ok: true, ignored: event.type });
     }
     const detailedSession = await fetchStripeSessionDetails(event.data.object || {});
-    const normalizedOrder = orderFromStripeSession(detailedSession);
+    const normalizedOrder = await orderFromStripeSession(detailedSession);
     if (event.type === "checkout.session.async_payment_succeeded") normalizedOrder.status = "paid";
     if (event.type === "checkout.session.async_payment_failed") normalizedOrder.status = "failed";
     if (event.type === "checkout.session.expired") normalizedOrder.status = "expired";
@@ -2063,12 +2632,88 @@ async function handleListProductIntakes(req, res) {
   jsonResponse(res, 200, { ok: true, intakes });
 }
 
-async function handleAnalyseExpressEmbeddedCheckout(res) {
+async function handleAdminProductSync(req, res) {
+  const admin = await requireSupabaseAdmin(req, res);
+  if (!admin) return;
+  try {
+    const fields = await readRequestBody(req);
+    const product = await supabaseProductBySlugOrId({
+      productId: cleanString(fields.product_id || fields.productId),
+      slug: cleanString(fields.slug)
+    });
+    if (!product) return jsonResponse(res, 404, { ok: false, error: "Produit introuvable." });
+    const sync = await syncProductWithStripe(product, "admin_sync");
+    jsonResponse(res, 200, {
+      ok: true,
+      product: {
+        id: sync.product.id,
+        slug: sync.product.slug,
+        title: sync.product.title,
+        stripe_product_id: sync.stripeProduct,
+        stripe_price_id: sync.stripePrice,
+        skipped: sync.skipped || null
+      }
+    });
+  } catch (error) {
+    jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+async function handleLibrarySignedDownload(req, res, url) {
+  const user = await supabaseAuthUser(req);
+  if (!user?.id) return jsonResponse(res, 401, { ok: false, error: "Connexion requise." });
+  const productId = cleanString(url.searchParams.get("product_id"));
+  if (!productId) return jsonResponse(res, 400, { ok: false, error: "product_id requis." });
+  const entitlement = await supabaseSelect("entitlements", {
+    select: "id,product_id,status,metadata",
+    user_id: `eq.${user.id}`,
+    product_id: `eq.${productId}`,
+    status: "eq.active",
+    limit: "1"
+  });
+  const hasAccess = entitlement.ok && Array.isArray(entitlement.data) && entitlement.data.length > 0;
+  if (!hasAccess) return jsonResponse(res, 403, { ok: false, error: "Achat verifie requis pour acceder a ce fichier." });
+  const file = await activeProductFile(productId);
+  if (!file?.storage_bucket || !file?.storage_path) {
+    return jsonResponse(res, 404, { ok: false, error: "Aucun fichier prive configure pour ce produit." });
+  }
+  const response = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/${encodeURIComponent(file.storage_bucket)}/${file.storage_path}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ expiresIn: 300 })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.signedURL) {
+    return jsonResponse(res, 502, { ok: false, error: payload.message || "Impossible de creer le lien securise." });
+  }
+  const signedUrl = payload.signedURL.startsWith("http")
+    ? payload.signedURL
+    : `${SUPABASE_URL}/storage/v1${payload.signedURL}`;
+  return jsonResponse(res, 200, { ok: true, url: signedUrl, expiresIn: 300, fileName: file.file_name || null });
+}
+
+async function handleAnalyseExpressEmbeddedCheckout(req, res) {
   if (!STRIPE_SECRET_KEY || !STRIPE_PUBLISHABLE_KEY) {
     return jsonResponse(res, 503, {
       ok: false,
       error: "Stripe embedded checkout n'est pas encore configure. Ajoute STRIPE_SECRET_KEY et STRIPE_PUBLISHABLE_KEY dans Render."
     });
+  }
+
+  if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+    try {
+      const fields = await readRequestBody(req);
+      const result = await dynamicCheckoutBody({ ...fields, slug: "analyse-express" }, { slug: "analyse-express", returnPath: "/analyse-express/" });
+      if (!result.error && result.session?.client_secret) {
+        return jsonResponse(res, 200, { ok: true, id: result.session.id, clientSecret: result.session.client_secret });
+      }
+    } catch {
+      // Keep the legacy Analyse Express route alive while the generic migration is validated.
+    }
   }
 
   const body = new URLSearchParams({
@@ -2284,9 +2929,13 @@ createServer((req, res) => {
   if (req.method === "GET" && url.pathname === "/api/leads") return handleListLeads(res);
   if (req.method === "GET" && url.pathname === "/api/config/public") return handlePublicConfig(res);
   if (req.method === "GET" && url.pathname === "/api/google-reviews") return handleGoogleReviews(res);
+  if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/checkout/session") return handleDynamicCheckoutSession(req, res, url);
+  if (req.method === "GET" && url.pathname === "/api/checkout/product") return handleDynamicCheckoutRedirect(res, url);
   if (req.method === "GET" && url.pathname === "/api/checkout/analyse-express") return handleAnalyseExpressCheckout(res);
-  if (req.method === "POST" && url.pathname === "/api/checkout/analyse-express/session") return handleAnalyseExpressEmbeddedCheckout(res);
+  if (req.method === "POST" && url.pathname === "/api/checkout/analyse-express/session") return handleAnalyseExpressEmbeddedCheckout(req, res);
   if (req.method === "POST" && url.pathname === "/api/stripe/webhook") return handleStripeWebhook(req, res);
+  if (req.method === "POST" && url.pathname === "/api/admin/products/sync-stripe") return handleAdminProductSync(req, res);
+  if (req.method === "GET" && url.pathname === "/api/library/download") return handleLibrarySignedDownload(req, res, url);
   if (req.method === "POST" && url.pathname === "/api/orders/analyse-express/intake") return handleAnalyseExpressIntake(req, res);
   if (req.method === "GET" && url.pathname === "/api/orders") return handleListOrders(req, res);
   if (req.method === "GET" && url.pathname === "/api/product-intakes") return handleListProductIntakes(req, res);
