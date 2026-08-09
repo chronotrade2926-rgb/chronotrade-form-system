@@ -1655,7 +1655,18 @@ async function syncPlanWithStripe(product, plan, reason = "plan_sync") {
   return { product: productSync.product, plan: { ...plan, stripe_price_id: stripePriceId }, stripeProduct: stripeProductId, stripePrice: stripePriceId };
 }
 
-async function validPromotionForProduct(code, product, customerEmail = "") {
+async function userProfileForPromotion(user) {
+  if (!user?.id) return null;
+  const result = await supabaseSelect("users", {
+    select: "id,email,created_at",
+    id: `eq.${user.id}`,
+    limit: "1"
+  });
+  const profile = result.ok && Array.isArray(result.data) ? result.data[0] : null;
+  return profile || { id: user.id, email: user.email || "", created_at: user.created_at || null };
+}
+
+async function validPromotionForProduct(code, product, customerEmail = "", user = null) {
   const cleanCode = String(code || "").trim().toUpperCase();
   if (!cleanCode) return null;
   const now = new Date().toISOString();
@@ -1668,12 +1679,30 @@ async function validPromotionForProduct(code, product, customerEmail = "") {
   const promo = result.ok && Array.isArray(result.data) ? result.data[0] : null;
   if (!promo) return null;
   if (promo.product_id && promo.product_id !== product.id) return null;
+  if (promo.user_id && promo.user_id !== user?.id) return null;
   if (promo.starts_at && promo.starts_at > now) return null;
   if (promo.ends_at && promo.ends_at < now) return null;
+  const userProfile = await userProfileForPromotion(user);
+  const isWelcomeOffer = cleanCode === "CHRONO10" || promo.metadata?.welcome_offer === true;
+  if (isWelcomeOffer) {
+    if (!userProfile?.id) return null;
+    const createdAt = userProfile.created_at ? new Date(userProfile.created_at).getTime() : 0;
+    const ageMs = Date.now() - createdAt;
+    if (!createdAt || ageMs > 48 * 60 * 60 * 1000) return null;
+  }
   const max = Number(promo.max_redemptions || 0);
   if (max > 0) {
     const redemptions = await supabaseSelect("promotion_redemptions", { select: "id", promotion_id: `eq.${promo.id}` });
     if (redemptions.ok && Array.isArray(redemptions.data) && redemptions.data.length >= max) return null;
+  }
+  const perUserLimit = Number(promo.per_user_limit || 0);
+  if (perUserLimit > 0 && user?.id) {
+    const redemptions = await supabaseSelect("promotion_redemptions", {
+      select: "id",
+      promotion_id: `eq.${promo.id}`,
+      user_id: `eq.${user.id}`
+    });
+    if (redemptions.ok && Array.isArray(redemptions.data) && redemptions.data.length >= perUserLimit) return null;
   }
   const amount = productAmountCents(product) || 0;
   const value = Number(promo.discount_value || 0);
@@ -2173,7 +2202,8 @@ async function dynamicCheckoutBody(fields = {}, options = {}) {
   const pricingModel = syncedPlan?.pricing_model || syncedProduct.pricing_model || "one_time";
   const stripeCustomerId = await ensureStripeCustomerForUser(authUser);
   const requestedPromotionCode = fields.promotion_code || fields.promo || "";
-  let promotion = await validPromotionForProduct(requestedPromotionCode, syncedProduct, authUser.email || fields.email);
+  const promotionCodeToCheck = requestedPromotionCode || "CHRONO10";
+  let promotion = await validPromotionForProduct(promotionCodeToCheck, syncedProduct, authUser.email || fields.email, authUser);
   if (requestedPromotionCode && !promotion) {
     return { errorStatus: 409, error: "Code promo invalide, expire ou non applicable a ce produit." };
   }
@@ -2216,8 +2246,6 @@ async function dynamicCheckoutBody(fields = {}, options = {}) {
   }
   if (promotion?.stripe_promotion_code_id) {
     body.set("discounts[0][promotion_code]", promotion.stripe_promotion_code_id);
-  } else if (!requestedPromotionCode) {
-    body.set("allow_promotion_codes", "true");
   }
   if (promotion?.id) {
     body.set("metadata[promotion_id]", promotion.id);
