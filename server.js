@@ -20,6 +20,11 @@ const PUBLIC_BASE_URL = cleanUrl(process.env.PUBLIC_BASE_URL || "");
 const SITE_ORIGIN = process.env.SITE_ORIGIN || "https://chronotradehub.com";
 const SUPABASE_URL = cleanUrl(process.env.SUPABASE_URL || process.env.PUBLIC_SUPABASE_URL || process.env.VITE_SUPABASE_URL || "");
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY || "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_NEED_MODEL = process.env.OPENAI_NEED_MODEL || "gpt-4.1-mini";
+const AI_NEED_TIMEOUT_MS = Number(process.env.AI_NEED_TIMEOUT_MS || 12000);
+const AI_MATCH_THRESHOLD_HIGH = Number(process.env.AI_MATCH_THRESHOLD_HIGH || 0.82);
+const AI_MATCH_THRESHOLD_LOW = Number(process.env.AI_MATCH_THRESHOLD_LOW || 0.55);
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
 const STRIPE_ANALYSE_EXPRESS_PRICE_ID = process.env.STRIPE_ANALYSE_EXPRESS_PRICE_ID || "";
@@ -1413,6 +1418,380 @@ async function supabaseProductPlan({ planId, productId, slug }) {
   return result.ok && Array.isArray(result.data) ? result.data[0] || null : null;
 }
 
+const resolveRiskRules = [
+  { status: "REJECTED_ILLEGAL", reason: "illegal_request", terms: ["faux document", "faux papiers", "fraude", "arnaque", "pirater", "hacker", "voler un compte", "carte bancaire volee", "blanchiment"] },
+  { status: "REJECTED_UNSAFE", reason: "unsafe_request", terms: ["arme", "explosif", "violence", "doxxing", "harceler", "pornographie explicite", "atteinte a la vie privee"] }
+];
+
+const needAnalysisSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "summary", "primary_problem", "secondary_problems", "desired_outcome", "user_type", "industry",
+    "category", "subcategory", "urgency", "budget_if_mentioned", "constraints", "solution_tags",
+    "commercial_intent", "repeatability_score", "estimated_complexity", "confidence_score",
+    "needs_human_review", "safe_to_process", "rejection_reason_if_any", "suggested_questions",
+    "user_facing_suggestion"
+  ],
+  properties: {
+    summary: { type: "string" },
+    primary_problem: { type: "string" },
+    secondary_problems: { type: "array", items: { type: "string" } },
+    desired_outcome: { type: "string" },
+    user_type: { type: "string" },
+    industry: { type: "string" },
+    category: { type: "string" },
+    subcategory: { type: "string" },
+    urgency: { type: "string", enum: ["low", "medium", "high", "unknown"] },
+    budget_if_mentioned: { type: "string" },
+    constraints: { type: "string" },
+    solution_tags: { type: "array", items: { type: "string" } },
+    commercial_intent: { type: "string", enum: ["low", "medium", "high", "unknown"] },
+    repeatability_score: { type: "number" },
+    estimated_complexity: { type: "string", enum: ["simple", "medium", "advanced", "complex", "unknown"] },
+    confidence_score: { type: "number" },
+    needs_human_review: { type: "boolean" },
+    safe_to_process: { type: "boolean" },
+    rejection_reason_if_any: { type: "string" },
+    suggested_questions: { type: "array", items: { type: "string" } },
+    user_facing_suggestion: { type: "string" }
+  }
+};
+
+function detectResolveRiskServer(text) {
+  const normalized = normalizeForScoring(text);
+  return resolveRiskRules.find((rule) => rule.terms.some((term) => normalized.includes(normalizeForScoring(term)))) || null;
+}
+
+function clampScore(value, fallback = 0) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(0, Math.min(1, number));
+}
+
+function arrayOfCleanStrings(value, limit = 12) {
+  if (!Array.isArray(value)) return [];
+  return value.map(cleanString).filter(Boolean).slice(0, limit);
+}
+
+async function activeNeedPrompt() {
+  const fallback = {
+    id: null,
+    name: "need_analysis",
+    version: "fallback",
+    usage: "resolve_need_analysis",
+    model: OPENAI_NEED_MODEL,
+    prompt: "Analyse une demande ChronoTrade en donnees structurees utiles. Ne jamais inventer de solution disponible."
+  };
+  const result = await supabaseSelect("ai_prompt_versions", {
+    select: "id,name,version,usage,model,prompt,active,metadata",
+    usage: "eq.resolve_need_analysis",
+    active: "eq.true",
+    order: "created_at.desc",
+    limit: "1"
+  });
+  return result.ok && Array.isArray(result.data) && result.data[0] ? result.data[0] : fallback;
+}
+
+function parseOpenAIJsonResponse(payload) {
+  if (typeof payload?.output_text === "string" && payload.output_text.trim()) return JSON.parse(payload.output_text);
+  const texts = [];
+  for (const item of payload?.output || []) {
+    for (const content of item.content || []) {
+      if (content.type === "output_text" && content.text) texts.push(content.text);
+      if (content.type === "text" && content.text) texts.push(content.text);
+    }
+  }
+  if (!texts.length) throw new Error("Reponse IA vide.");
+  return JSON.parse(texts.join("\n"));
+}
+
+async function callNeedAnalysisModel({ need, prompt }) {
+  if (!OPENAI_API_KEY) return { skipped: true, reason: "OPENAI_API_KEY missing" };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AI_NEED_TIMEOUT_MS);
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        authorization: `Bearer ${OPENAI_API_KEY}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: prompt.model || OPENAI_NEED_MODEL,
+        input: [
+          {
+            role: "system",
+            content: [
+              prompt.prompt,
+              "Tu ne dois pas afficher de raisonnement interne.",
+              "Tu ne dois pas inventer de produit, service ou partenaire comme disponible.",
+              "Si le besoin manque d'informations, propose 1 a 3 questions maximum.",
+              "Retourne uniquement l'objet JSON conforme au schema."
+            ].join("\n")
+          },
+          {
+            role: "user",
+            content: [
+              `Besoin brut: ${need.raw_text}`,
+              `Profil: ${need.user_type || "non precise"}`,
+              `Secteur: ${need.industry || "non precise"}`,
+              `Objectif detecte: ${need.objective || "non precise"}`,
+              `Urgence/priorite: ${need.priority || need.urgency || "non precise"}`
+            ].join("\n")
+          }
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "chronotrade_need_analysis",
+            strict: true,
+            schema: needAnalysisSchema
+          }
+        }
+      })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error?.message || `OpenAI ${response.status}`);
+    return { ok: true, payload, analysis: parseOpenAIJsonResponse(payload) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function fallbackNeedAnalysis(need, risk = null) {
+  const text = normalizeForScoring(need.raw_text);
+  const tags = [];
+  const add = (tag) => { if (!tags.includes(tag)) tags.push(tag); };
+  if (text.includes("avis") || text.includes("google")) add("avis Google");
+  if (text.includes("automatis") || text.includes("temps") || text.includes("repet")) add("automatisation");
+  if (text.includes("site") || text.includes("landing")) add("site web");
+  if (text.includes("logo") || text.includes("marque") || text.includes("branding")) add("branding");
+  if (text.includes("application") || text.includes("app")) add("application");
+  if (text.includes("partenaire") || text.includes("prestataire")) add("partenaire");
+  const category = tags.includes("avis Google") ? "Reputation / fidelisation"
+    : tags.includes("automatisation") ? "Automatisation / productivite"
+    : tags.includes("site web") ? "Site / presence digitale"
+    : tags.includes("branding") ? "Image / branding"
+    : tags.includes("partenaire") ? "Partenaires / business"
+    : "Besoin a qualifier";
+  return {
+    summary: risk ? "Demande necessitant une revue avant traitement." : (need.title || "Besoin ChronoTrade a qualifier"),
+    primary_problem: need.title || need.raw_text.slice(0, 140),
+    secondary_problems: [],
+    desired_outcome: need.objective || need.priority || "Trouver une solution adaptee",
+    user_type: need.user_type || "unknown",
+    industry: need.industry || "unknown",
+    category,
+    subcategory: tags[0] || "general",
+    urgency: need.urgency || "unknown",
+    budget_if_mentioned: need.budget_range || "",
+    constraints: "",
+    solution_tags: tags,
+    commercial_intent: "unknown",
+    repeatability_score: tags.length ? 0.55 : 0.25,
+    estimated_complexity: "unknown",
+    confidence_score: risk ? 0.2 : (tags.length ? 0.62 : 0.35),
+    needs_human_review: Boolean(risk) || tags.length === 0,
+    safe_to_process: !risk,
+    rejection_reason_if_any: risk?.reason || "",
+    suggested_questions: tags.length ? [] : ["Quel resultat concret voulez-vous obtenir en priorite ?"],
+    user_facing_suggestion: risk
+      ? "Votre demande a ete recue et sera verifiee manuellement avant toute reponse."
+      : "Votre besoin a ete compris dans ses grandes lignes. ChronoTrade va chercher la solution la plus adaptee."
+  };
+}
+
+function solutionSearchText(solution) {
+  return normalizeForScoring([
+    solution.name,
+    solution.description,
+    solution.type,
+    solution.price_model,
+    solution.internal_or_external,
+    ...(solution.problems_solved || []),
+    ...(solution.target_users || []),
+    ...(solution.industries || []),
+    ...(solution.metadata?.tags || []),
+    ...(solution.metadata?.intents || [])
+  ].join(" "));
+}
+
+function scoreSolutionMatch(solution, analysis, need) {
+  const haystack = solutionSearchText(solution);
+  const tags = arrayOfCleanStrings(analysis.solution_tags, 16);
+  let score = 0;
+  for (const tag of tags) if (haystack.includes(normalizeForScoring(tag))) score += 0.24;
+  if (analysis.category && haystack.includes(normalizeForScoring(analysis.category))) score += 0.18;
+  if (analysis.subcategory && haystack.includes(normalizeForScoring(analysis.subcategory))) score += 0.16;
+  if (analysis.industry && haystack.includes(normalizeForScoring(analysis.industry))) score += 0.08;
+  const rawWords = normalizeForScoring(need.raw_text).split(/\s+/).filter((word) => word.length > 4);
+  const hits = rawWords.filter((word) => haystack.includes(word)).slice(0, 8).length;
+  score += Math.min(0.24, hits * 0.03);
+  if (solution.public && solution.active) score += 0.08;
+  return clampScore(score, 0);
+}
+
+async function matchNeedSolutions(need, analysis) {
+  const result = await supabaseSelect("solutions", {
+    select: "id,type,name,slug,description,problems_solved,target_users,industries,price_model,price,recurring,internal_or_external,product_id,active,public,metadata",
+    active: "eq.true",
+    order: "updated_at.desc",
+    limit: "80"
+  });
+  const solutions = result.ok && Array.isArray(result.data) ? result.data : [];
+  const matches = solutions
+    .map((solution) => ({ solution, score: scoreSolutionMatch(solution, analysis, need) }))
+    .filter((row) => row.score >= AI_MATCH_THRESHOLD_LOW)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+  const payloads = [];
+  for (let index = 0; index < matches.length; index += 1) {
+    const row = matches[index];
+    const confidenceBand = row.score >= AI_MATCH_THRESHOLD_HIGH ? "high" : row.score >= AI_MATCH_THRESHOLD_LOW ? "medium" : "low";
+    const matchPayload = {
+      need_id: need.id,
+      solution_id: row.solution.id,
+      product_id: row.solution.product_id || null,
+      match_type: OPENAI_API_KEY ? "ai_assisted" : "fallback",
+      rank: index + 1,
+      score: Number(row.score.toFixed(3)),
+      status: confidenceBand === "high" ? "suggested" : "suggested",
+      rationale: `Correspondance basee sur les tags: ${arrayOfCleanStrings(analysis.solution_tags, 6).join(", ") || "besoin a qualifier"}.`,
+      match_reason: `${row.solution.name} couvre une partie du besoin detecte (${analysis.category || "categorie a qualifier"}).`,
+      user_facing_copy: `Cette piste peut aider sur: ${analysis.primary_problem || analysis.summary || "votre besoin"}.`,
+      confidence_band: confidenceBand,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    const inserted = await supabaseInsert("need_solution_matches", matchPayload);
+    payloads.push({ ...matchPayload, solution: row.solution, insert: inserted.ok });
+  }
+  return payloads;
+}
+
+async function recordNeedEvent(needId, userId, eventType, details = {}) {
+  if (!needId) return null;
+  return supabaseInsert("need_events", {
+    need_id: needId,
+    user_id: userId || null,
+    event_type: eventType,
+    from_status: details.from_status || null,
+    to_status: details.to_status || null,
+    note: details.note || null,
+    metadata: details.metadata || {}
+  });
+}
+
+async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
+  if (!need?.id) return { skipped: true, reason: "missing_need" };
+  const prompt = await activeNeedPrompt();
+  const startedRun = await supabaseInsert("ai_analysis_runs", {
+    need_id: need.id,
+    prompt_version_id: prompt.id || null,
+    provider: "openai",
+    model: prompt.model || OPENAI_NEED_MODEL,
+    status: OPENAI_API_KEY ? "started" : "skipped",
+    created_at: new Date().toISOString()
+  });
+  const runId = Array.isArray(startedRun.data) ? startedRun.data[0]?.id : startedRun.data?.id;
+  await recordNeedEvent(need.id, need.user_id, "ai_analysis_started", { metadata: { model: prompt.model || OPENAI_NEED_MODEL, enabled: Boolean(OPENAI_API_KEY) } });
+  let analysis = null;
+  let modelResult = null;
+  let aiStatus = "completed";
+  let errorMessage = "";
+  try {
+    const risk = payloadRisk || detectResolveRiskServer(need.raw_text);
+    if (risk) {
+      analysis = fallbackNeedAnalysis(need, risk);
+      aiStatus = "skipped";
+    } else if (OPENAI_API_KEY) {
+      modelResult = await callNeedAnalysisModel({ need, prompt });
+      analysis = modelResult.analysis;
+    } else {
+      analysis = fallbackNeedAnalysis(need, null);
+      aiStatus = "skipped";
+    }
+  } catch (error) {
+    analysis = fallbackNeedAnalysis(need, null);
+    aiStatus = error.name === "AbortError" ? "timeout" : "failed";
+    errorMessage = error.message;
+  }
+  analysis.confidence_score = clampScore(analysis.confidence_score, 0);
+  analysis.repeatability_score = clampScore(analysis.repeatability_score, 0);
+  analysis.secondary_problems = arrayOfCleanStrings(analysis.secondary_problems, 8);
+  analysis.solution_tags = arrayOfCleanStrings(analysis.solution_tags, 12);
+  analysis.suggested_questions = arrayOfCleanStrings(analysis.suggested_questions, 3);
+
+  const analysisInsert = await supabaseInsert("need_analysis", {
+    need_id: need.id,
+    summary: cleanString(analysis.summary),
+    primary_problem: cleanString(analysis.primary_problem),
+    secondary_problems: analysis.secondary_problems,
+    category: cleanString(analysis.category),
+    subcategory: cleanString(analysis.subcategory),
+    desired_outcome: cleanString(analysis.desired_outcome),
+    constraints: cleanString(analysis.constraints),
+    estimated_complexity: cleanString(analysis.estimated_complexity),
+    commercial_value_score: analysis.commercial_intent === "high" ? 0.85 : analysis.commercial_intent === "medium" ? 0.55 : 0.25,
+    repeatability_score: analysis.repeatability_score,
+    confidence: analysis.confidence_score,
+    analysis_version: `${prompt.name || "need_analysis"}:${prompt.version || "v1"}`,
+    user_type: cleanString(analysis.user_type),
+    urgency: cleanString(analysis.urgency),
+    budget_if_mentioned: cleanString(analysis.budget_if_mentioned),
+    solution_tags: analysis.solution_tags,
+    commercial_intent: cleanString(analysis.commercial_intent),
+    needs_human_review: Boolean(analysis.needs_human_review),
+    safe_to_process: Boolean(analysis.safe_to_process),
+    rejection_reason_if_any: cleanString(analysis.rejection_reason_if_any),
+    user_facing_suggestion: cleanString(analysis.user_facing_suggestion),
+    suggested_questions: analysis.suggested_questions,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  });
+
+  for (const tag of analysis.solution_tags) {
+    await supabaseInsert("need_tags", { need_id: need.id, tag, source: OPENAI_API_KEY ? "ai" : "fallback" });
+  }
+  const matches = analysis.safe_to_process ? await matchNeedSolutions(need, analysis) : [];
+  const bestScore = matches[0]?.score || 0;
+  const nextStatus = !analysis.safe_to_process
+    ? (analysis.rejection_reason_if_any === "illegal_request" ? "REJECTED_ILLEGAL" : "REJECTED_UNSAFE")
+    : matches.length === 0
+      ? "UNRESOLVED"
+      : analysis.needs_human_review || analysis.confidence_score < AI_MATCH_THRESHOLD_LOW
+        ? "NEEDS_HUMAN_REVIEW"
+        : bestScore >= AI_MATCH_THRESHOLD_HIGH && analysis.confidence_score >= AI_MATCH_THRESHOLD_HIGH
+          ? "MATCHED"
+          : "ANALYZING";
+  await supabaseUpdate("needs", {
+    status: nextStatus,
+    detected_category: analysis.category || need.detected_category,
+    detected_objective: analysis.desired_outcome || need.detected_objective,
+    urgency: analysis.urgency === "unknown" ? need.urgency || null : analysis.urgency,
+    budget_range: analysis.budget_if_mentioned || need.budget_range || null,
+    is_unmet: nextStatus === "UNRESOLVED",
+    updated_at: new Date().toISOString()
+  }, { id: `eq.${need.id}` }, { returnRepresentation: false });
+  await recordNeedEvent(need.id, need.user_id, aiStatus === "completed" ? "ai_analysis_completed" : "ai_analysis_failed", { to_status: nextStatus, note: errorMessage || null, metadata: { confidence: analysis.confidence_score, matches: matches.length } });
+  if (matches.length) await recordNeedEvent(need.id, need.user_id, "ai_match_generated", { metadata: { bestScore, matches: matches.map((match) => ({ solution_id: match.solution_id, score: match.score })) } });
+  if (runId) {
+    await supabaseUpdate("ai_analysis_runs", {
+      status: aiStatus,
+      confidence_score: analysis.confidence_score,
+      needs_human_review: Boolean(analysis.needs_human_review),
+      safe_to_process: Boolean(analysis.safe_to_process),
+      error_message: errorMessage || null,
+      usage: modelResult?.payload?.usage || {},
+      result: { analysis, matches: matches.map((match) => ({ solution_id: match.solution_id, score: match.score, confidence_band: match.confidence_band })) },
+      completed_at: new Date().toISOString()
+    }, { id: `eq.${runId}` }, { returnRepresentation: false });
+  }
+  return { ok: true, status: nextStatus, analysis, matches, runStatus: aiStatus, analysisInsert };
+}
+
 async function supabaseAuthUser(req) {
   const header = req.headers.authorization || req.headers.Authorization || "";
   const token = String(header).startsWith("Bearer ") ? String(header).slice(7).trim() : "";
@@ -2256,12 +2635,13 @@ async function handleResolveNeed(req, res) {
     if (!body.consent_service) {
       return jsonResponse(res, 422, { ok: false, error: "Consentement de service requis." });
     }
+    const serverRisk = detectResolveRiskServer(rawText);
     const payload = {
       user_id: authUser?.id || null,
       session_id: cleanString(body.session_id) || randomUUID(),
       raw_text: rawText,
       title: cleanString(body.title) || (rawText.length > 82 ? `${rawText.slice(0, 79)}...` : rawText),
-      status: cleanString(body.status) || "NEW",
+      status: serverRisk?.status || cleanString(body.status) || "NEW",
       user_type: cleanString(body.user_type) || null,
       industry: cleanString(body.industry) || null,
       objective: cleanString(body.objective) || null,
@@ -2287,8 +2667,11 @@ async function handleResolveNeed(req, res) {
       detected_category: cleanString(body.detected_category) || null,
       detected_objective: cleanString(body.detected_objective) || null,
       recommended_services: Array.isArray(body.recommended_services) ? body.recommended_services.map(cleanString).filter(Boolean).slice(0, 8) : [],
-      is_unmet: Boolean(body.is_unmet),
-      metadata: body.metadata && typeof body.metadata === "object" ? body.metadata : {}
+      is_unmet: Boolean(body.is_unmet || serverRisk),
+      metadata: {
+        ...(body.metadata && typeof body.metadata === "object" ? body.metadata : {}),
+        serverRisk: serverRisk ? { status: serverRisk.status, reason: serverRisk.reason } : null
+      }
     };
     const inserted = await supabaseInsert("needs", payload);
     if (!inserted.ok) return jsonResponse(res, 500, { ok: false, error: inserted.message, integrations: { supabase: inserted } });
@@ -2303,11 +2686,25 @@ async function handleResolveNeed(req, res) {
         metadata: { source: "api_resolve_need" }
       });
     }
+    const ai = need?.id ? await analyzeNeedAfterSubmission({ ...need, ...payload, id: need.id }, serverRisk) : { skipped: true, reason: "need_insert_missing" };
     const notification = await sendResolveInternalNotification({ ...payload, id: need?.id });
     return jsonResponse(res, 201, {
       ok: true,
-      need: { id: need?.id || null, status: payload.status, ref: need?.id ? `REQ-${String(need.id).slice(0, 8).toUpperCase()}` : null },
-      integrations: { supabase: inserted, notification }
+      need: { id: need?.id || null, status: ai?.status || payload.status, ref: need?.id ? `REQ-${String(need.id).slice(0, 8).toUpperCase()}` : null },
+      suggestion: ai?.analysis?.user_facing_suggestion || null,
+      questions: ai?.analysis?.suggested_questions || [],
+      matches: (ai?.matches || []).map((match) => ({
+        solutionId: match.solution_id,
+        score: match.score,
+        confidenceBand: match.confidence_band,
+        name: match.solution?.name || "",
+        slug: match.solution?.slug || "",
+        type: match.solution?.type || "",
+        productId: match.solution?.product_id || null,
+        reason: match.user_facing_copy || match.match_reason || ""
+      })),
+      noCurrentSolution: (ai?.status || payload.status) === "UNRESOLVED",
+      integrations: { supabase: inserted, notification, ai: { ok: Boolean(ai?.ok), status: ai?.runStatus || ai?.status || "skipped" } }
     });
   } catch (error) {
     return jsonResponse(res, 500, { ok: false, error: error.message });
@@ -2334,6 +2731,25 @@ async function sendResolveInternalNotification(need) {
       `Recommandations: ${(need.recommended_services || []).join(", ") || "a qualifier"}`,
       `Source: ${need.utm_source || need.source_channel || "site"}`
     ].join("\n")
+  });
+}
+
+async function handleAdminAnalyzeNeed(req, res, needId) {
+  const admin = await requireSupabaseAdmin(req, res);
+  if (!admin) return;
+  const result = await supabaseSelect("needs", { select: "*", id: `eq.${cleanString(needId)}`, limit: "1" });
+  const need = result.ok && Array.isArray(result.data) ? result.data[0] : null;
+  if (!need?.id) return jsonResponse(res, 404, { ok: false, error: "Besoin introuvable." });
+  const ai = await analyzeNeedAfterSubmission(need, detectResolveRiskServer(need.raw_text));
+  await recordNeedEvent(need.id, need.user_id, "human_correction", {
+    note: `Analyse relancee par ${admin.profile?.email || admin.user?.email || "admin"}.`,
+    metadata: { action: "admin_reanalyze_need", adminId: admin.user?.id || null }
+  });
+  return jsonResponse(res, 200, {
+    ok: true,
+    need: { id: need.id, status: ai.status || need.status },
+    analysis: ai.analysis || null,
+    matches: (ai.matches || []).map((match) => ({ solutionId: match.solution_id, score: match.score, confidenceBand: match.confidence_band }))
   });
 }
 
@@ -3582,6 +3998,7 @@ function handleHealth(res) {
       googleProfileUrl: Boolean(GOOGLE_BUSINESS_PROFILE_URL),
       supabaseUrl: Boolean(SUPABASE_URL),
       supabaseServiceRole: Boolean(SUPABASE_SERVICE_ROLE_KEY),
+      openaiNeedAnalysis: Boolean(OPENAI_API_KEY),
       outlookGraph: Boolean(process.env.MICROSOFT_GRAPH_TOKEN || (process.env.MICROSOFT_CLIENT_ID && process.env.MICROSOFT_REFRESH_TOKEN))
     }
   });
@@ -3761,6 +4178,9 @@ createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/api/checkout/analyse-express/session") return handleAnalyseExpressEmbeddedCheckout(req, res);
   if (req.method === "POST" && url.pathname === "/api/stripe/webhook") return handleStripeWebhook(req, res);
   if (req.method === "POST" && url.pathname === "/api/admin/products/sync-stripe") return handleAdminProductSync(req, res);
+  if (req.method === "POST" && url.pathname.startsWith("/api/admin/needs/") && url.pathname.endsWith("/analyze")) {
+    return handleAdminAnalyzeNeed(req, res, url.pathname.replace("/api/admin/needs/", "").replace("/analyze", ""));
+  }
   if (req.method === "GET" && url.pathname === "/api/library/download") return handleLibrarySignedDownload(req, res, url);
   if (req.method === "GET" && url.pathname === "/api/project-deliverables/download") return handleProjectDeliverableDownload(req, res, url);
   if (req.method === "POST" && url.pathname === "/api/billing/portal") return handleBillingPortal(req, res);
