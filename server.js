@@ -2649,8 +2649,10 @@ async function handleResolveNeed(req, res) {
       budget_range: cleanString(body.budget_range) || null,
       urgency: cleanString(body.urgency) || null,
       contact_email: cleanString(body.contact_email) || authUser?.email || null,
+      email: cleanString(body.contact_email) || authUser?.email || null,
       contact_name: cleanString(body.contact_name) || null,
       wants_contact: Boolean(body.wants_contact || body.contact_email || authUser?.email),
+      contact_permission: body.consent_marketing ? "marketing" : (body.contact_email || authUser?.email) ? "service_only" : "none",
       consent_service: Boolean(body.consent_service),
       consent_marketing: Boolean(body.consent_marketing),
       source_channel: cleanString(body.source_channel) || "resolve_home",
@@ -2687,6 +2689,17 @@ async function handleResolveNeed(req, res) {
       });
     }
     const ai = need?.id ? await analyzeNeedAfterSubmission({ ...need, ...payload, id: need.id }, serverRisk) : { skipped: true, reason: "need_insert_missing" };
+    if (need?.id && payload.contact_email) await recordNeedEvent(need.id, payload.user_id, "email_provided", { metadata: { permission: payload.contact_permission } });
+    if (need?.id && ai?.matches?.length) await recordNeedEvent(need.id, payload.user_id, "solution_suggested", { metadata: { count: ai.matches.length, bestScore: ai.matches[0]?.score || 0 } });
+    if (need?.id && (ai?.status || payload.status) === "UNRESOLVED") await recordNeedEvent(need.id, payload.user_id, "need_unresolved", { metadata: { reason: "no_current_solution" } });
+    const clientEmail = await sendResolveClientConfirmation({ ...payload, id: need?.id }, ai);
+    if (need?.id) {
+      await supabaseUpdate("needs", {
+        user_response_status: clientEmail.enabled ? (clientEmail.ok ? "sent" : "failed") : "not_applicable",
+        user_response_sent_at: clientEmail.enabled && clientEmail.ok ? new Date().toISOString() : null,
+        updated_at: new Date().toISOString()
+      }, { id: `eq.${need.id}` }, { returnRepresentation: false });
+    }
     const notification = await sendResolveInternalNotification({ ...payload, id: need?.id });
     return jsonResponse(res, 201, {
       ok: true,
@@ -2704,7 +2717,7 @@ async function handleResolveNeed(req, res) {
         reason: match.user_facing_copy || match.match_reason || ""
       })),
       noCurrentSolution: (ai?.status || payload.status) === "UNRESOLVED",
-      integrations: { supabase: inserted, notification, ai: { ok: Boolean(ai?.ok), status: ai?.runStatus || ai?.status || "skipped" } }
+      integrations: { supabase: inserted, notification, clientEmail, ai: { ok: Boolean(ai?.ok), status: ai?.runStatus || ai?.status || "skipped" } }
     });
   } catch (error) {
     return jsonResponse(res, 500, { ok: false, error: error.message });
@@ -2734,6 +2747,61 @@ async function sendResolveInternalNotification(need) {
   });
 }
 
+async function sendResolveClientConfirmation(need, ai = {}) {
+  if (!need.contact_email) return { enabled: false, message: "Email client absent." };
+  const status = ai?.status || need.status || "NEW";
+  const noSolution = status === "UNRESOLVED";
+  const matches = ai?.matches || [];
+  const text = [
+    `Bonjour${need.contact_name ? ` ${need.contact_name}` : ""},`,
+    "",
+    "Votre demande ChronoTrade a bien ete recue.",
+    "",
+    ai?.analysis?.user_facing_suggestion || (noSolution
+      ? "Pas encore de solution immediate : votre demande est conservee et pourra servir a creer ou vous proposer une solution adaptee plus tard."
+      : "ChronoTrade va analyser votre besoin et vous proposer la suite la plus adaptee."),
+    "",
+    matches.length ? "Pistes trouvees :" : "",
+    ...matches.slice(0, 3).map((match) => `- ${match.solution?.name || "Solution ChronoTrade"} : ${match.user_facing_copy || match.match_reason || "piste a verifier"}`),
+    "",
+    "Reference : " + (need.id ? `REQ-${String(need.id).slice(0, 8).toUpperCase()}` : "en cours"),
+    "Vous pouvez creer un compte ChronoTrade pour sauvegarder et suivre vos demandes.",
+    "",
+    "Flo - ChronoTrade"
+  ].filter((line) => line !== "").join("\n");
+  const email = {
+    to: need.contact_email,
+    subject: "Votre demande ChronoTrade a bien ete recue",
+    text
+  };
+  const result = await sendViaGraph(email);
+  await addOutbox([{ id: randomUUID(), needId: need.id || null, type: "resolve_client_confirmation", status: result.ok ? "sent" : "prepared", sendResult: result, createdAt: new Date().toISOString(), ...email }]);
+  return result;
+}
+
+async function handleResolveClarification(req, res, needId) {
+  try {
+    const body = await readRequestBody(req);
+    const authUser = await supabaseAuthUser(req);
+    const question = cleanString(body.question);
+    const answer = cleanString(body.answer);
+    if (!question || !answer) return jsonResponse(res, 422, { ok: false, error: "Question et reponse requises." });
+    const inserted = await supabaseInsert("need_clarifications", {
+      need_id: cleanString(needId),
+      user_id: authUser?.id || null,
+      session_id: cleanString(body.session_id) || null,
+      question,
+      answer,
+      source: "user"
+    });
+    if (!inserted.ok) return jsonResponse(res, 500, { ok: false, error: inserted.message });
+    await recordNeedEvent(cleanString(needId), authUser?.id || null, "clarification_answered", { metadata: { question } });
+    return jsonResponse(res, 201, { ok: true });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
 async function handleAdminAnalyzeNeed(req, res, needId) {
   const admin = await requireSupabaseAdmin(req, res);
   if (!admin) return;
@@ -2751,6 +2819,38 @@ async function handleAdminAnalyzeNeed(req, res, needId) {
     analysis: ai.analysis || null,
     matches: (ai.matches || []).map((match) => ({ solutionId: match.solution_id, score: match.score, confidenceBand: match.confidence_band }))
   });
+}
+
+async function handlePrivacyRequest(req, res) {
+  try {
+    const body = await readRequestBody(req);
+    const authUser = await supabaseAuthUser(req);
+    const requestType = cleanString(body.request_type || body.requestType || "other");
+    const allowed = new Set(["access","export","rectification","delete_need","delete_account","marketing_opt_out","other"]);
+    if (!allowed.has(requestType)) return jsonResponse(res, 422, { ok: false, error: "Type de demande invalide." });
+    const email = cleanString(body.email || authUser?.email).toLowerCase();
+    if (!email && !authUser?.id) return jsonResponse(res, 422, { ok: false, error: "Email requis pour traiter la demande." });
+    const payload = {
+      user_id: authUser?.id || null,
+      email: email || null,
+      request_type: requestType,
+      target_type: cleanString(body.target_type || body.targetType) || null,
+      target_id: cleanString(body.target_id || body.targetId) || null,
+      message: cleanString(body.message) || null,
+      metadata: body.metadata && typeof body.metadata === "object" ? body.metadata : {}
+    };
+    const inserted = await supabaseInsert("privacy_requests", payload);
+    const emailPayload = {
+      to: process.env.INTERNAL_NOTIFICATION_EMAIL || companyProfile.email,
+      subject: `Demande confidentialite ChronoTrade - ${requestType}`,
+      text: [`Type: ${requestType}`, `Email: ${email || "compte connecte"}`, `Cible: ${payload.target_type || "-"} ${payload.target_id || ""}`, "", payload.message || ""].join("\n")
+    };
+    const notification = process.env.INTERNAL_NOTIFICATION_EMAIL ? await sendViaGraph(emailPayload) : { enabled: false, message: "Email interne absent." };
+    await addOutbox([{ id: randomUUID(), type: "privacy_request", status: notification.ok ? "sent" : "prepared", sendResult: notification, createdAt: new Date().toISOString(), ...emailPayload }]);
+    return jsonResponse(res, inserted.ok ? 201 : 500, { ok: Boolean(inserted.ok), request: inserted.data, notification, error: inserted.ok ? null : inserted.message });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
 }
 
 async function handleListLeads(res) {
@@ -4156,6 +4256,10 @@ createServer((req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/leads") return handleLead(req, res);
   if (req.method === "POST" && url.pathname === "/api/resolve/needs") return handleResolveNeed(req, res);
+  if (req.method === "POST" && url.pathname.startsWith("/api/resolve/needs/") && url.pathname.endsWith("/clarification")) {
+    return handleResolveClarification(req, res, url.pathname.replace("/api/resolve/needs/", "").replace("/clarification", ""));
+  }
+  if (req.method === "POST" && url.pathname === "/api/privacy/request") return handlePrivacyRequest(req, res);
   if (req.method === "POST" && url.pathname === "/api/forms/devis") return handleLiveForm(req, res, "devis");
   if (req.method === "POST" && url.pathname === "/api/forms/sur-mesure") return handleLiveForm(req, res, "sur-mesure");
   if (req.method === "POST" && url.pathname === "/api/forms/vision") return handleLiveForm(req, res, "vision");
