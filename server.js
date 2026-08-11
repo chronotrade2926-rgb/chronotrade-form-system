@@ -1291,6 +1291,47 @@ async function supabaseUserIdByEmail(email) {
   return Array.isArray(data) && data[0]?.id ? data[0].id : null;
 }
 
+async function awardUserBadgeByCode(userId, code, details = {}) {
+  if (!userId || !code) return { skipped: true, reason: "missing_user_or_code" };
+  const badge = await supabaseSelect("badge_catalog", { select: "id,code,label,status", code: `eq.${code}`, limit: "1" });
+  const badgeRow = badge.ok && Array.isArray(badge.data) ? badge.data[0] : null;
+  if (!badgeRow?.id || badgeRow.status !== "active") return { skipped: true, reason: "badge_unavailable", code };
+  return supabaseUpsert("user_badges", {
+    user_id: userId,
+    badge_id: badgeRow.id,
+    source_type: details.sourceType || "system",
+    source_id: details.sourceId || null,
+    metadata: {
+      code,
+      label: badgeRow.label,
+      ...details
+    }
+  }, "user_id,badge_id");
+}
+
+async function unlockUserCosmetic(userId, cosmeticKey, payload = {}) {
+  if (!userId || !cosmeticKey) return { skipped: true, reason: "missing_user_or_cosmetic" };
+  return supabaseUpsert("user_cosmetics", {
+    user_id: userId,
+    cosmetic_type: payload.cosmeticType || "banner",
+    code: cosmeticKey,
+    cosmetic_key: cosmeticKey,
+    label: payload.label || "Style ChronoTrade debloque",
+    status: payload.status || "unlocked",
+    equipped: Boolean(payload.equipped),
+    unlocked_at: payload.unlockedAt || new Date().toISOString(),
+    metadata: {
+      sourceType: payload.sourceType || "system",
+      sourceId: payload.sourceId || null,
+      productId: payload.productId || null,
+      productSlug: payload.productSlug || null,
+      orderId: payload.orderId || null,
+      accent: payload.accent || "violet"
+    },
+    updated_at: new Date().toISOString()
+  }, "user_id,cosmetic_key");
+}
+
 async function supabaseSelect(table, params = {}) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     return { enabled: false, ok: false, message: "Variables Supabase absentes." };
@@ -1343,7 +1384,7 @@ async function supabaseUpdate(table, payload, filters = {}, options = {}) {
 }
 
 async function supabaseProductBySlugOrId({ slug, productId, stripePriceId }) {
-  const select = "id,title,slug,short_description,description,product_type,delivery_type,price_cents,currency,stripe_product_id,stripe_price_id,stripe_price_amount,stripe_price_currency,stripe_price_active,stripe_last_sync_at,stripe_sync_error,pricing_model,availability,status,checkout_url,form_url,current_version,delivery_config,email_config,commerce_config,presentation_config,social_proof_config,metadata";
+  const select = "id,title,slug,short_description,description,product_type,delivery_type,price_cents,currency,stripe_product_id,stripe_price_id,stripe_price_amount,stripe_price_currency,stripe_price_active,stripe_last_sync_at,stripe_sync_error,pricing_model,availability,lifecycle_status,cta_mode,provider_type,status,checkout_url,form_url,current_version,delivery_config,email_config,commerce_config,presentation_config,social_proof_config,metadata";
   if (productId) {
     const result = await supabaseSelect("products", { select, id: `eq.${productId}`, limit: "1" });
     return result.ok && Array.isArray(result.data) ? result.data[0] || null : null;
@@ -1468,6 +1509,61 @@ async function activeProductFile(productId) {
     limit: "1"
   });
   return result.ok && Array.isArray(result.data) ? result.data[0] || null : null;
+}
+
+async function productComponentsByBundle(productId) {
+  if (!productId) return [];
+  const result = await supabaseSelect("product_components", {
+    select: "id,bundle_product_id,component_product_id,quantity,access_type,sort_order,metadata",
+    bundle_product_id: `eq.${productId}`,
+    order: "sort_order.asc,created_at.asc"
+  });
+  return result.ok && Array.isArray(result.data) ? result.data : [];
+}
+
+async function awardPackComponentEntitlements(order, userId, syncedOrderId) {
+  if (!userId || !order?.productId) return [];
+  const components = await productComponentsByBundle(order.productId);
+  const results = [];
+  for (const component of components) {
+    const product = await supabaseProductBySlugOrId({ productId: component.component_product_id });
+    if (!product?.id) {
+      results.push({ skipped: true, reason: "component_product_missing", componentId: component.id });
+      continue;
+    }
+    const privateFile = await activeProductFile(product.id);
+    const accessUrl = productAccessUrl(product, order.stripeSessionId || "");
+    const sync = await supabaseUpsert("entitlements", {
+      user_id: userId,
+      product_id: product.id,
+      order_id: syncedOrderId || null,
+      resource_type: product.slug || component.access_type || "product",
+      status: "active",
+      access_url: accessUrl,
+      version: product.current_version || privateFile?.version || "1.0",
+      metadata: {
+        label: product.title,
+        source: "pack_component",
+        bundleProductId: order.productId,
+        bundleProductSlug: order.productSlug || order.product || null,
+        componentId: component.id,
+        accessType: component.access_type || "included",
+        quantity: component.quantity || 1,
+        stripeSessionId: order.stripeSessionId || null,
+        privateFile: privateFile ? {
+          bucket: privateFile.storage_bucket,
+          path: privateFile.storage_path,
+          fileName: privateFile.file_name,
+          version: privateFile.version
+        } : null,
+        ...(component.metadata || {})
+      },
+      created_at: order.createdAt,
+      updated_at: order.updatedAt
+    }, "user_id,resource_type,access_url");
+    results.push({ componentId: component.id, productId: product.id, entitlement: sync });
+  }
+  return results;
 }
 
 async function syncProductWithStripe(product, reason = "manual_sync") {
@@ -1666,18 +1762,21 @@ async function userProfileForPromotion(user) {
   return profile || { id: user.id, email: user.email || "", created_at: user.created_at || null };
 }
 
-async function validPromotionForProduct(code, product, customerEmail = "", user = null) {
-  const cleanCode = String(code || "").trim().toUpperCase();
-  if (!cleanCode) return null;
+function promotionDiscountCents(promo, product) {
+  const amount = productAmountCents(product) || 0;
+  const value = Number(promo.discount_value || 0);
+  const discountCents = promo.discount_type === "fixed"
+    ? Math.min(amount, Math.round(value * 100))
+    : Math.min(amount, Math.round(amount * (value / 100)));
+  return Math.max(0, discountCents);
+}
+
+async function promotionAppliesToProduct(promo, product, customerEmail = "", user = null) {
+  if (!promo?.id || !product?.id) return null;
+  const cleanCode = String(promo.code || "").trim().toUpperCase();
   const now = new Date().toISOString();
-  const result = await supabaseSelect("promotions", {
-    select: "*",
-    code: `eq.${cleanCode}`,
-    status: "eq.active",
-    limit: "1"
-  });
-  const promo = result.ok && Array.isArray(result.data) ? result.data[0] : null;
-  if (!promo) return null;
+  if (promo.status && promo.status !== "active") return null;
+  if (promo.stacking_policy === "disabled") return null;
   if (promo.product_id && promo.product_id !== product.id) return null;
   if (promo.user_id && promo.user_id !== user?.id) return null;
   if (promo.starts_at && promo.starts_at > now) return null;
@@ -1704,12 +1803,44 @@ async function validPromotionForProduct(code, product, customerEmail = "", user 
     });
     if (redemptions.ok && Array.isArray(redemptions.data) && redemptions.data.length >= perUserLimit) return null;
   }
-  const amount = productAmountCents(product) || 0;
-  const value = Number(promo.discount_value || 0);
-  const discountCents = promo.discount_type === "fixed"
-    ? Math.min(amount, Math.round(value * 100))
-    : Math.min(amount, Math.round(amount * (value / 100)));
-  return { ...promo, discount_cents: Math.max(0, discountCents), customer_email: customerEmail };
+  return { ...promo, discount_cents: promotionDiscountCents(promo, product), customer_email: customerEmail };
+}
+
+async function validPromotionForProduct(code, product, customerEmail = "", user = null) {
+  const cleanCode = String(code || "").trim().toUpperCase();
+  if (!cleanCode) return null;
+  const result = await supabaseSelect("promotions", {
+    select: "*",
+    code: `eq.${cleanCode}`,
+    status: "eq.active",
+    limit: "1"
+  });
+  const promo = result.ok && Array.isArray(result.data) ? result.data[0] : null;
+  return promotionAppliesToProduct(promo, product, customerEmail, user);
+}
+
+async function bestPromotionForProduct(product, customerEmail = "", user = null) {
+  if (!product?.id) return null;
+  const result = await supabaseSelect("promotions", {
+    select: "*",
+    status: "eq.active",
+    order: "created_at.desc",
+    limit: "50"
+  });
+  const promotions = result.ok && Array.isArray(result.data) ? result.data : [];
+  const applicable = [];
+  for (const promo of promotions) {
+    const code = String(promo.code || "").trim().toUpperCase();
+    const autoApply = promo.product_id === product.id || code === "CHRONO10" || promo.metadata?.auto_apply === true;
+    if (!autoApply) continue;
+    const evaluated = await promotionAppliesToProduct(promo, product, customerEmail, user);
+    if (evaluated?.discount_cents > 0) applicable.push(evaluated);
+  }
+  applicable.sort((a, b) => {
+    if (b.discount_cents !== a.discount_cents) return b.discount_cents - a.discount_cents;
+    return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
+  });
+  return applicable[0] || null;
 }
 
 async function syncPromotionWithStripe(promotion, product) {
@@ -2114,6 +2245,98 @@ async function createLead(res, service, answers) {
     });
 }
 
+async function handleResolveNeed(req, res) {
+  try {
+    const body = await readRequestBody(req);
+    const authUser = await supabaseAuthUser(req);
+    const rawText = cleanString(body.raw_text || body.rawText);
+    if (rawText.length < 12) {
+      return jsonResponse(res, 422, { ok: false, error: "Besoin trop court." });
+    }
+    if (!body.consent_service) {
+      return jsonResponse(res, 422, { ok: false, error: "Consentement de service requis." });
+    }
+    const payload = {
+      user_id: authUser?.id || null,
+      session_id: cleanString(body.session_id) || randomUUID(),
+      raw_text: rawText,
+      title: cleanString(body.title) || (rawText.length > 82 ? `${rawText.slice(0, 79)}...` : rawText),
+      status: cleanString(body.status) || "NEW",
+      user_type: cleanString(body.user_type) || null,
+      industry: cleanString(body.industry) || null,
+      objective: cleanString(body.objective) || null,
+      priority: cleanString(body.priority) || null,
+      budget_range: cleanString(body.budget_range) || null,
+      urgency: cleanString(body.urgency) || null,
+      contact_email: cleanString(body.contact_email) || authUser?.email || null,
+      contact_name: cleanString(body.contact_name) || null,
+      wants_contact: Boolean(body.wants_contact || body.contact_email || authUser?.email),
+      consent_service: Boolean(body.consent_service),
+      consent_marketing: Boolean(body.consent_marketing),
+      source_channel: cleanString(body.source_channel) || "resolve_home",
+      source_campaign: cleanString(body.source_campaign) || null,
+      source_content: cleanString(body.source_content) || null,
+      utm_source: cleanString(body.utm_source) || null,
+      utm_medium: cleanString(body.utm_medium) || null,
+      utm_campaign: cleanString(body.utm_campaign) || null,
+      utm_content: cleanString(body.utm_content) || null,
+      landing_page: cleanString(body.landing_page) || null,
+      referrer: cleanString(body.referrer) || null,
+      first_touch: body.first_touch && typeof body.first_touch === "object" ? body.first_touch : {},
+      last_touch: body.last_touch && typeof body.last_touch === "object" ? body.last_touch : {},
+      detected_category: cleanString(body.detected_category) || null,
+      detected_objective: cleanString(body.detected_objective) || null,
+      recommended_services: Array.isArray(body.recommended_services) ? body.recommended_services.map(cleanString).filter(Boolean).slice(0, 8) : [],
+      is_unmet: Boolean(body.is_unmet),
+      metadata: body.metadata && typeof body.metadata === "object" ? body.metadata : {}
+    };
+    const inserted = await supabaseInsert("needs", payload);
+    if (!inserted.ok) return jsonResponse(res, 500, { ok: false, error: inserted.message, integrations: { supabase: inserted } });
+    const need = Array.isArray(inserted.data) ? inserted.data[0] : inserted.data;
+    if (need?.id) {
+      await supabaseInsert("need_events", {
+        need_id: need.id,
+        user_id: payload.user_id,
+        event_type: "submitted",
+        to_status: payload.status,
+        note: "Demande transmise via l'API Resolve ChronoTrade.",
+        metadata: { source: "api_resolve_need" }
+      });
+    }
+    const notification = await sendResolveInternalNotification({ ...payload, id: need?.id });
+    return jsonResponse(res, 201, {
+      ok: true,
+      need: { id: need?.id || null, status: payload.status, ref: need?.id ? `REQ-${String(need.id).slice(0, 8).toUpperCase()}` : null },
+      integrations: { supabase: inserted, notification }
+    });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+async function sendResolveInternalNotification(need) {
+  const to = process.env.INTERNAL_NOTIFICATION_EMAIL;
+  if (!to) return { enabled: false, message: "Email interne absent." };
+  return sendViaGraph({
+    to,
+    subject: `Nouveau besoin Resolve ChronoTrade - ${need.detected_category || "a qualifier"}`,
+    text: [
+      `Reference: ${need.id ? `REQ-${String(need.id).slice(0, 8).toUpperCase()}` : "non disponible"}`,
+      `Statut: ${need.status || "NEW"}`,
+      `Profil: ${need.user_type || "non precise"}`,
+      `Secteur: ${need.industry || "non precise"}`,
+      `Priorite: ${need.priority || "non precisee"}`,
+      `Email: ${need.contact_email || "non fourni"}`,
+      "",
+      "Besoin exprime:",
+      need.raw_text,
+      "",
+      `Recommandations: ${(need.recommended_services || []).join(", ") || "a qualifier"}`,
+      `Source: ${need.utm_source || need.source_channel || "site"}`
+    ].join("\n")
+  });
+}
+
 async function handleListLeads(res) {
   const prospects = await readJson(prospectsPath, []);
   jsonResponse(res, 200, { ok: true, prospects });
@@ -2178,7 +2401,9 @@ async function dynamicCheckoutBody(fields = {}, options = {}) {
   });
   if (!product) return { errorStatus: 404, error: "Produit introuvable." };
   if (product.status !== "published") return { errorStatus: 409, error: "Ce produit n'est pas disponible a l'achat." };
-  if (["archived", "unavailable"].includes(String(product.availability || "").toLowerCase())) {
+  const lifecycleStatus = String(product.lifecycle_status || product.availability || "").toLowerCase();
+  const blockedStates = ["archived", "unavailable", "coming_soon", "waitlist", "private_beta", "public_beta", "chronolab", "draft"];
+  if (blockedStates.includes(lifecycleStatus) || ["archived", "unavailable"].includes(String(product.availability || "").toLowerCase())) {
     return { errorStatus: 409, error: "Ce produit est actuellement indisponible." };
   }
   const plan = await supabaseProductPlan({
@@ -2202,8 +2427,9 @@ async function dynamicCheckoutBody(fields = {}, options = {}) {
   const pricingModel = syncedPlan?.pricing_model || syncedProduct.pricing_model || "one_time";
   const stripeCustomerId = await ensureStripeCustomerForUser(authUser);
   const requestedPromotionCode = fields.promotion_code || fields.promo || "";
-  const promotionCodeToCheck = requestedPromotionCode || "CHRONO10";
-  let promotion = await validPromotionForProduct(promotionCodeToCheck, syncedProduct, authUser.email || fields.email, authUser);
+  let promotion = requestedPromotionCode
+    ? await validPromotionForProduct(requestedPromotionCode, syncedProduct, authUser.email || fields.email, authUser)
+    : await bestPromotionForProduct(syncedProduct, authUser.email || fields.email, authUser);
   if (requestedPromotionCode && !promotion) {
     return { errorStatus: 409, error: "Code promo invalide, expire ou non applicable a ce produit." };
   }
@@ -2499,6 +2725,7 @@ async function orderFromStripeSession(session) {
     product,
     productId: dbProduct?.id || session.metadata?.product_id || null,
     productSlug: dbProduct?.slug || product,
+    productType: dbProduct?.product_type || "",
     productVersion: dbProduct?.current_version || "1.0",
     userId: session.metadata?.user_id || "",
     productLabel: dbProduct?.title || (product === "analyse_express" || product === "analyse-express" ? "Analyse Express ChronoTrade" : product),
@@ -2508,6 +2735,7 @@ async function orderFromStripeSession(session) {
     amountCents: Number(session.amount_total || 0),
     discountCents: Number(session.metadata?.discount_cents || 0),
     currency: String(session.currency || "eur").toUpperCase(),
+    stripeCustomerId: typeof session.customer === "string" ? session.customer : session.customer?.id || "",
     customerEmail: session.customer_details?.email || session.customer_email || "",
     customerName: session.customer_details?.name || "",
     invoiceUrl: session.invoice?.hosted_invoice_url || "",
@@ -2557,6 +2785,7 @@ async function syncSupabaseOrder(order) {
     discount_cents: order.discountCents || 0,
     currency: order.currency || "EUR",
     action_url: order.questionnaireUrl || order.accessUrl || null,
+    stripe_customer_id: order.stripeCustomerId || null,
     stripe_session_id: order.stripeSessionId || null,
     stripe_payment_intent: typeof order.stripePaymentIntent === "string" ? order.stripePaymentIntent : order.stripePaymentIntent?.id || null,
     stripe_price_id: order.stripePriceId || null,
@@ -2627,7 +2856,25 @@ async function syncSupabaseOrder(order) {
       updated_at: order.updatedAt
     }, "user_id,resource_type,access_url");
     await scheduleProductFollowupEmail(order, userId, syncedOrderId);
-    return { order: orderSync, entitlement: entitlementSync };
+    const firstPurchaseReward = await awardUserBadgeByCode(userId, "first_purchase", {
+      sourceType: "stripe_order",
+      sourceId: order.stripeSessionId || syncedOrderId || null,
+      productId: order.productId || null,
+      productSlug: order.productSlug || null,
+      orderId: syncedOrderId || null
+    });
+    const firstPurchaseCosmetic = await unlockUserCosmetic(userId, "first-purchase-chronotrade-banner", {
+      cosmeticType: "banner",
+      label: "Banniere Premier achat ChronoTrade",
+      sourceType: "stripe_order",
+      sourceId: order.stripeSessionId || syncedOrderId || null,
+      productId: order.productId || null,
+      productSlug: order.productSlug || null,
+      orderId: syncedOrderId || null,
+      accent: "gold"
+    });
+    const packEntitlements = await awardPackComponentEntitlements(order, userId, syncedOrderId);
+    return { order: orderSync, entitlement: entitlementSync, packEntitlements, firstPurchaseReward, firstPurchaseCosmetic };
   }
   return { order: orderSync, entitlement: { skipped: true, reason: userId ? "payment_not_paid" : "user_not_found" } };
 }
@@ -2659,21 +2906,63 @@ async function scheduleProductFollowupEmail(order, userId, syncedOrderId) {
   }, "order_id,type");
 }
 
+async function recordStripeEventStart(event) {
+  if (!event?.id || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return { enabled: false, duplicate: false };
+  const existing = await supabaseSelect("stripe_events", {
+    select: "id,status",
+    stripe_event_id: `eq.${event.id}`,
+    limit: "1"
+  });
+  if (existing.ok && Array.isArray(existing.data) && existing.data.length) {
+    return { enabled: true, duplicate: true, event: existing.data[0] };
+  }
+  const object = event.data?.object || {};
+  const inserted = await supabaseInsert("stripe_events", {
+    stripe_event_id: event.id,
+    event_type: event.type,
+    livemode: Boolean(event.livemode),
+    status: "processing",
+    object_id: object.id || null,
+    payload: event
+  });
+  if (!inserted.ok && String(inserted.message || "").includes("duplicate")) {
+    return { enabled: true, duplicate: true, event: inserted.data };
+  }
+  return { enabled: true, duplicate: false, event: inserted.data, ok: inserted.ok, message: inserted.message };
+}
+
+async function recordStripeEventFinish(event, status = "processed", errorMessage = "") {
+  if (!event?.id || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return { enabled: false };
+  return supabaseUpdate("stripe_events", {
+    status,
+    processed_at: status === "processed" || status === "ignored" ? new Date().toISOString() : null,
+    error_message: errorMessage || null,
+    updated_at: new Date().toISOString()
+  }, { stripe_event_id: `eq.${event.id}` }, { returnRepresentation: false });
+}
+
 function buildOrderClientEmail(order) {
   const isAnalyse = order.productSlug === "analyse-express" || order.product === "analyse_express";
-  const accessLabel = isAnalyse ? "Questionnaire" : "Acces";
+  const isSubscription = order.raw?.mode === "subscription";
+  const isApp = ["app", "agent_ai", "automation"].includes(String(order.productType || order.deliveryType || "").toLowerCase());
+  const accessLabel = isAnalyse ? "Questionnaire" : isApp ? "Ouvrir" : "Acces";
   const accessUrl = order.questionnaireUrl || order.accessUrl || `${SITE_ORIGIN}/dashboard/bibliotheque/`;
+  const nextLine = isAnalyse
+    ? "Prochaine etape : completez le questionnaire court pour que je puisse analyser votre projet correctement."
+    : isSubscription
+      ? "Votre formule est rattachee a votre compte. La gestion bancaire reste securisee dans Stripe."
+      : isApp
+        ? "Votre application ou automatisation est activee dans votre espace ChronoTrade."
+        : "Votre achat est maintenant rattache a votre espace ChronoTrade.";
   return {
     to: order.customerEmail,
-    subject: isAnalyse ? "Votre Analyse Express ChronoTrade est confirmee" : `Votre ${order.productLabel} est disponible`,
+    subject: isAnalyse ? "Votre Analyse Express ChronoTrade est confirmee" : isSubscription ? `Votre abonnement ${order.productLabel} est actif` : `Votre ${order.productLabel} est disponible`,
     text: [
       `Bonjour ${order.customerName || ""}`.trim() + ",",
       "",
       `Votre paiement pour ${order.productLabel} a bien ete confirme.`,
       "",
-      isAnalyse
-        ? "Prochaine etape : completez le questionnaire court pour que je puisse analyser votre projet correctement."
-        : "Votre achat est maintenant rattache a votre espace ChronoTrade.",
+      nextLine,
       accessUrl ? `${accessLabel} : ${accessUrl}` : "",
       !isAnalyse ? "Vous pourrez egalement le retrouver dans : Mon compte -> Bibliotheque." : "",
       "",
@@ -2696,6 +2985,45 @@ function buildOrderInternalEmail(order) {
       order.questionnaireUrl ? `Questionnaire : ${order.questionnaireUrl}` : ""
     ].filter(Boolean).join("\n")
   };
+}
+
+async function handleStripeRefundEvent(event) {
+  const object = event.data?.object || {};
+  const paymentIntentId = typeof object.payment_intent === "string" ? object.payment_intent : object.payment_intent?.id || "";
+  const chargeId = object.object === "charge" ? object.id : (typeof object.charge === "string" ? object.charge : object.charge?.id || "");
+  if (!paymentIntentId) return { skipped: true, reason: "missing_payment_intent", chargeId };
+  const filters = {
+    select: "id,user_id,product_id,stripe_payment_intent,status,metadata",
+    limit: "1"
+  };
+  if (paymentIntentId) filters.stripe_payment_intent = `eq.${paymentIntentId}`;
+  const orderResult = await supabaseSelect("orders_or_projects", filters);
+  const order = orderResult.ok && Array.isArray(orderResult.data) ? orderResult.data[0] : null;
+  if (!order?.id) return { skipped: true, reason: "order_not_found" };
+  const now = new Date().toISOString();
+  const orderUpdate = await supabaseUpdate("orders_or_projects", {
+    status: "refunded",
+    delivery_status: "canceled",
+    refunded_at: now,
+    metadata: {
+      ...(order.metadata || {}),
+      refund: {
+        stripeEventId: event.id,
+        chargeId,
+        paymentIntentId,
+        amountRefunded: object.amount_refunded || object.amount || null,
+        currency: object.currency || null,
+        receivedAt: now
+      }
+    },
+    updated_at: now
+  }, { id: `eq.${order.id}` });
+  const entitlementUpdate = await supabaseUpdate("entitlements", {
+    status: "revoked",
+    revoked_at: now,
+    updated_at: now
+  }, { order_id: `eq.${order.id}` }, { returnRepresentation: false });
+  return { order: orderUpdate, entitlements: entitlementUpdate };
 }
 
 async function notifyOrder(order) {
@@ -2726,17 +3054,21 @@ async function notifyOrder(order) {
 }
 
 async function handleStripeWebhook(req, res) {
+  let rawBody = null;
+  let event = null;
   try {
-    const rawBody = await readRawBody(req);
+    rawBody = await readRawBody(req);
     const signature = req.headers["stripe-signature"];
     const verification = verifyStripeWebhookSignature(rawBody, signature);
     if (!verification.ok) return jsonResponse(res, 400, { ok: false, error: verification.message });
-    const event = JSON.parse(rawBody.toString("utf8"));
+    event = JSON.parse(rawBody.toString("utf8"));
     const supportedEvents = new Set([
       "checkout.session.completed",
       "checkout.session.async_payment_succeeded",
       "checkout.session.async_payment_failed",
       "checkout.session.expired",
+      "charge.refunded",
+      "refund.updated",
       "customer.subscription.created",
       "customer.subscription.updated",
       "customer.subscription.deleted",
@@ -2745,14 +3077,24 @@ async function handleStripeWebhook(req, res) {
       "invoice.payment_failed"
     ]);
     if (!supportedEvents.has(event.type)) {
+      await recordStripeEventFinish(event, "ignored");
       return jsonResponse(res, 200, { ok: true, ignored: event.type });
+    }
+    const eventRecord = await recordStripeEventStart(event);
+    if (eventRecord.duplicate) return jsonResponse(res, 200, { ok: true, duplicate: true, event: event.type });
+    if (event.type === "charge.refunded" || event.type === "refund.updated") {
+      const refund = await handleStripeRefundEvent(event);
+      await recordStripeEventFinish(event, "processed");
+      return jsonResponse(res, 200, { ok: true, event: event.type, refund });
     }
     if (event.type.startsWith("customer.subscription.")) {
       const subscription = await handleStripeSubscriptionEvent(event);
+      await recordStripeEventFinish(event, "processed");
       return jsonResponse(res, 200, { ok: true, event: event.type, subscription });
     }
     if (event.type.startsWith("invoice.")) {
       const subscription = await handleStripeInvoiceEvent(event);
+      await recordStripeEventFinish(event, "processed");
       return jsonResponse(res, 200, { ok: true, event: event.type, subscription });
     }
     const detailedSession = await fetchStripeSessionDetails(event.data.object || {});
@@ -2768,8 +3110,12 @@ async function handleStripeWebhook(req, res) {
     const order = await upsertLocalOrder(normalizedOrder);
     const supabase = await syncSupabaseOrder(order);
     const notification = order.status === "paid" ? await notifyOrder(order) : { skipped: true };
+    await recordStripeEventFinish(event, "processed");
     return jsonResponse(res, 200, { ok: true, event: event.type, order, integrations: { supabase, notification } });
   } catch (error) {
+    try {
+      await recordStripeEventFinish(event, "failed", error.message);
+    } catch {}
     return jsonResponse(res, 500, { ok: false, error: error.message });
   }
 }
@@ -2928,6 +3274,45 @@ async function handleLibrarySignedDownload(req, res, url) {
   return jsonResponse(res, 200, { ok: true, url: signedUrl, expiresIn: 300, fileName: file.file_name || null });
 }
 
+async function handleProjectDeliverableDownload(req, res, url) {
+  const user = await supabaseAuthUser(req);
+  if (!user?.id) return jsonResponse(res, 401, { ok: false, error: "Connexion requise." });
+  const deliverableId = cleanString(url.searchParams.get("id"));
+  if (!deliverableId) return jsonResponse(res, 400, { ok: false, error: "id livrable requis." });
+  const result = await supabaseSelect("project_deliverables", {
+    select: "id,user_id,title,status,file_url,storage_bucket,storage_path,metadata",
+    id: `eq.${deliverableId}`,
+    user_id: `eq.${user.id}`,
+    status: "eq.available",
+    limit: "1"
+  });
+  const deliverable = result.ok && Array.isArray(result.data) ? result.data[0] : null;
+  if (!deliverable) return jsonResponse(res, 404, { ok: false, error: "Livrable indisponible pour ce compte." });
+  if (!deliverable.storage_bucket || !deliverable.storage_path) {
+    if (deliverable.file_url && !String(deliverable.file_url).startsWith("private://")) {
+      return jsonResponse(res, 200, { ok: true, url: deliverable.file_url, expiresIn: null, fileName: deliverable.metadata?.fileName || deliverable.title || null });
+    }
+    return jsonResponse(res, 404, { ok: false, error: "Aucun fichier prive configure pour ce livrable." });
+  }
+  const response = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/${encodeURIComponent(deliverable.storage_bucket)}/${deliverable.storage_path}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ expiresIn: 300 })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.signedURL) {
+    return jsonResponse(res, 502, { ok: false, error: payload.message || "Impossible de creer le lien securise." });
+  }
+  const signedUrl = payload.signedURL.startsWith("http")
+    ? payload.signedURL
+    : `${SUPABASE_URL}/storage/v1${payload.signedURL}`;
+  return jsonResponse(res, 200, { ok: true, url: signedUrl, expiresIn: 300, fileName: deliverable.metadata?.fileName || deliverable.title || null });
+}
+
 async function handleBillingPortal(req, res) {
   const user = await requireSupabaseUser(req, res);
   if (!user) return;
@@ -2986,6 +3371,109 @@ async function handleProductReview(req, res) {
   }
 }
 
+function publicSiteReview(row) {
+  return {
+    id: row.id,
+    author: row.author_name,
+    company: row.company || "",
+    role: row.role_label || "",
+    rating: Number(row.rating || 0),
+    title: row.title || "",
+    body: row.body || "",
+    source: row.source || "site",
+    verifiedClient: Boolean(row.verified_client),
+    adminReply: row.admin_reply || "",
+    createdAt: row.created_at
+  };
+}
+
+async function handleSiteReviews(res, url) {
+  const limit = Math.max(1, Math.min(12, Number(url.searchParams.get("limit") || 6)));
+  const result = await supabaseSelect("site_reviews_public", {
+    select: "id,author_name,company,role_label,rating,title,body,source,verified_client,admin_reply,created_at",
+    order: "created_at.desc",
+    limit: String(limit)
+  });
+  if (!result.ok) return jsonResponse(res, 200, { ok: false, reviews: [], error: result.message });
+  const reviews = Array.isArray(result.data) ? result.data.map(publicSiteReview) : [];
+  const averageRating = reviews.length
+    ? reviews.reduce((total, review) => total + Number(review.rating || 0), 0) / reviews.length
+    : null;
+  return jsonResponse(res, 200, { ok: true, reviews, averageRating, total: reviews.length });
+}
+
+function buildSiteReviewInternalEmail(review) {
+  return {
+    to: process.env.INTERNAL_NOTIFICATION_EMAIL || companyProfile.email,
+    subject: `Nouvel avis ChronoTrade a moderer - ${review.rating}/5`,
+    text: [
+      "Un nouvel avis a ete envoye depuis le site ChronoTrade.",
+      "",
+      `Nom : ${review.author_name}`,
+      `Email : ${review.email || "Non renseigne"}`,
+      `Entreprise : ${review.company || "Non renseignee"}`,
+      `Note : ${review.rating}/5`,
+      `Titre : ${review.title || "Sans titre"}`,
+      "",
+      review.body,
+      "",
+      "Statut : pending",
+      "Action : connecte-toi au super-admin ChronoTrade pour publier, masquer ou repondre."
+    ].join("\n"),
+    html: `<p>Un nouvel avis a ete envoye depuis le site ChronoTrade.</p><ul><li><strong>Nom :</strong> ${escapeHtml(review.author_name)}</li><li><strong>Email :</strong> ${escapeHtml(review.email || "Non renseigne")}</li><li><strong>Entreprise :</strong> ${escapeHtml(review.company || "Non renseignee")}</li><li><strong>Note :</strong> ${Number(review.rating || 0)}/5</li><li><strong>Titre :</strong> ${escapeHtml(review.title || "Sans titre")}</li></ul><p>${escapeHtml(review.body)}</p><p><strong>Statut :</strong> pending. A moderer dans le super-admin ChronoTrade.</p>`
+  };
+}
+
+async function handleSiteReviewSubmit(req, res) {
+  try {
+    const fields = await readRequestBody(req);
+    if (cleanString(fields.website || fields.company_website_hidden)) {
+      return jsonResponse(res, 202, { ok: true, pending: true });
+    }
+    const authorName = cleanString(fields.author_name || fields.author || fields.name).slice(0, 120);
+    const email = cleanString(fields.email).toLowerCase().slice(0, 180);
+    const company = cleanString(fields.company).slice(0, 140);
+    const roleLabel = cleanString(fields.role_label || fields.role).slice(0, 140);
+    const title = cleanString(fields.title).slice(0, 140);
+    const body = cleanString(fields.body || fields.message).slice(0, 1600);
+    const rating = Math.max(1, Math.min(5, Number(fields.rating || 0)));
+    if (!authorName || !body || !rating) {
+      return jsonResponse(res, 400, { ok: false, error: "Nom, note et avis sont obligatoires." });
+    }
+    if (body.length < 12) {
+      return jsonResponse(res, 400, { ok: false, error: "L'avis est trop court pour etre utile." });
+    }
+    const authUser = await supabaseAuthUser(req);
+    const userId = authUser?.id || (email ? await supabaseUserIdByEmail(email) : null);
+    const payload = {
+      user_id: userId,
+      author_name: authorName,
+      email: email || null,
+      company: company || null,
+      role_label: roleLabel || null,
+      rating,
+      title: title || null,
+      body,
+      source: "site",
+      status: "pending",
+      verified_client: false,
+      metadata: {
+        page: cleanString(fields.page || "avis"),
+        userAgent: cleanString(req.headers["user-agent"]).slice(0, 240)
+      }
+    };
+    const inserted = await supabaseInsert("site_reviews", payload);
+    if (!inserted.ok) return jsonResponse(res, 500, { ok: false, error: inserted.message || "Avis indisponible." });
+    const review = Array.isArray(inserted.data) ? inserted.data[0] : inserted.data;
+    const emailPayload = buildSiteReviewInternalEmail(payload);
+    const notification = process.env.INTERNAL_NOTIFICATION_EMAIL ? await sendViaGraph(emailPayload) : { enabled: false, message: "Email interne absent." };
+    await addOutbox([{ id: randomUUID(), reviewId: review?.id || null, type: "site_review_pending", status: notification.ok ? "sent" : "prepared", sendResult: notification, createdAt: new Date().toISOString(), ...emailPayload }]);
+    return jsonResponse(res, 201, { ok: true, pending: true, review: { id: review?.id || null } });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
 async function handleAnalyseExpressEmbeddedCheckout(req, res) {
   if (!STRIPE_SECRET_KEY || !STRIPE_PUBLISHABLE_KEY) {
     return jsonResponse(res, 503, {
@@ -3018,6 +3506,66 @@ function handlePublicConfig(res) {
     googleReviewUrl: GOOGLE_BUSINESS_REVIEW_URL,
     googleProfileUrl: GOOGLE_BUSINESS_PROFILE_URL
   });
+}
+
+function publicPromotionDiscountLabel(promo) {
+  const value = Number(promo.discount_value || 0);
+  if (!value) return "";
+  if (promo.discount_type === "fixed") return `-${value.toLocaleString("fr-FR", { maximumFractionDigits: 2 })} EUR`;
+  return `-${Math.round(value)}%`;
+}
+
+async function publicPromotionPayload(promo) {
+  const product = promo.product_id ? await supabaseProductBySlugOrId({ productId: promo.product_id }) : null;
+  return {
+    id: promo.id,
+    code: promo.code || "",
+    label: promo.label || promo.code || "Offre ChronoTrade",
+    discountLabel: publicPromotionDiscountLabel(promo),
+    startsAt: promo.starts_at || null,
+    endsAt: promo.ends_at || null,
+    banner: {
+      enabled: Boolean(promo.banner_enabled),
+      titleFr: promo.banner_title_fr || promo.label || "Offre ChronoTrade active",
+      titleEn: promo.banner_title_en || promo.banner_title_fr || promo.label || "ChronoTrade offer",
+      ctaLabelFr: promo.banner_cta_label_fr || "Voir l'offre",
+      ctaLabelEn: promo.banner_cta_label_en || promo.banner_cta_label_fr || "View offer",
+      ctaUrl: promo.banner_cta_url || (product?.slug ? `/produit/?slug=${encodeURIComponent(product.slug)}` : "/catalogue/"),
+      style: promo.banner_style || "premium"
+    },
+    product: product ? {
+      id: product.id,
+      slug: product.slug,
+      title: product.title,
+      priceCents: productAmountCents(product),
+      currency: product.currency || "EUR"
+    } : null
+  };
+}
+
+async function handlePublicPromotions(res) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    return jsonResponse(res, 200, { ok: true, promotions: [] });
+  }
+  const result = await supabaseSelect("promotions", {
+    select: "*",
+    status: "eq.active",
+    order: "created_at.desc",
+    limit: "20"
+  });
+  if (!result.ok || !Array.isArray(result.data)) {
+    return jsonResponse(res, 200, { ok: true, promotions: [] });
+  }
+  const now = Date.now();
+  const visible = result.data.filter((promo) => {
+    if (!promo.banner_enabled) return false;
+    if (promo.starts_at && new Date(promo.starts_at).getTime() > now) return false;
+    if (promo.ends_at && new Date(promo.ends_at).getTime() < now) return false;
+    return true;
+  }).slice(0, 6);
+  const promotions = [];
+  for (const promo of visible) promotions.push(await publicPromotionPayload(promo));
+  jsonResponse(res, 200, { ok: true, promotions });
 }
 
 function handleHealth(res) {
@@ -3190,6 +3738,7 @@ createServer((req, res) => {
     return res.end();
   }
   if (req.method === "POST" && url.pathname === "/api/leads") return handleLead(req, res);
+  if (req.method === "POST" && url.pathname === "/api/resolve/needs") return handleResolveNeed(req, res);
   if (req.method === "POST" && url.pathname === "/api/forms/devis") return handleLiveForm(req, res, "devis");
   if (req.method === "POST" && url.pathname === "/api/forms/sur-mesure") return handleLiveForm(req, res, "sur-mesure");
   if (req.method === "POST" && url.pathname === "/api/forms/vision") return handleLiveForm(req, res, "vision");
@@ -3202,7 +3751,10 @@ createServer((req, res) => {
   if (req.method === "GET" && url.pathname === "/api/health") return handleHealth(res);
   if (req.method === "GET" && url.pathname === "/api/leads") return handleListLeads(res);
   if (req.method === "GET" && url.pathname === "/api/config/public") return handlePublicConfig(res);
+  if (req.method === "GET" && url.pathname === "/api/promotions/public") return handlePublicPromotions(res);
   if (req.method === "GET" && url.pathname === "/api/google-reviews") return handleGoogleReviews(res);
+  if (req.method === "GET" && url.pathname === "/api/site-reviews") return handleSiteReviews(res, url);
+  if (req.method === "POST" && url.pathname === "/api/site-reviews") return handleSiteReviewSubmit(req, res);
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/checkout/session") return handleDynamicCheckoutSession(req, res, url);
   if (req.method === "GET" && url.pathname === "/api/checkout/product") return handleDynamicCheckoutRedirect(res, url);
   if (req.method === "GET" && url.pathname === "/api/checkout/analyse-express") return handleAnalyseExpressCheckout(res);
@@ -3210,6 +3762,7 @@ createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/api/stripe/webhook") return handleStripeWebhook(req, res);
   if (req.method === "POST" && url.pathname === "/api/admin/products/sync-stripe") return handleAdminProductSync(req, res);
   if (req.method === "GET" && url.pathname === "/api/library/download") return handleLibrarySignedDownload(req, res, url);
+  if (req.method === "GET" && url.pathname === "/api/project-deliverables/download") return handleProjectDeliverableDownload(req, res, url);
   if (req.method === "POST" && url.pathname === "/api/billing/portal") return handleBillingPortal(req, res);
   if (req.method === "POST" && url.pathname === "/api/product-reviews") return handleProductReview(req, res);
   if (req.method === "POST" && url.pathname === "/api/orders/analyse-express/intake") return handleAnalyseExpressIntake(req, res);

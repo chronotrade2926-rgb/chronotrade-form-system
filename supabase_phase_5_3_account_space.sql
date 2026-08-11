@@ -34,6 +34,7 @@ create table if not exists public.entitlements (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references public.users(id) on delete cascade,
   product_id uuid references public.products(id) on delete set null,
+  order_id uuid references public.orders_or_projects(id) on delete set null,
   resource_type text not null default 'product',
   status text not null default 'active' check (status in ('active', 'paused', 'expired', 'revoked')),
   access_url text,
@@ -42,6 +43,8 @@ create table if not exists public.entitlements (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.entitlements add column if not exists order_id uuid references public.orders_or_projects(id) on delete set null;
 
 alter table public.entitlements drop constraint if exists entitlements_user_resource_access_unique;
 alter table public.entitlements

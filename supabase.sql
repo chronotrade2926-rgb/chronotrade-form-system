@@ -25,7 +25,7 @@ values ('flo.chronotrade@outlook.fr')
 on conflict (email) do nothing;
 
 insert into public.admin_emails(email)
-values ('bouchonneflorent@gmail.com'), ('chronotrade29-26@gmail.com')
+values ('bouchonnetflorent@gmail.com'), ('chronotrade2926@gmail.com')
 on conflict (email) do nothing;
 
 create table if not exists public.partners (

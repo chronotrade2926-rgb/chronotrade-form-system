@@ -9,13 +9,13 @@ alter table public.users
 insert into public.admin_emails(email)
 values
   ('flo.chronotrade@outlook.fr'),
-  ('bouchonneflorent@gmail.com'),
-  ('chronotrade29-26@gmail.com')
+  ('bouchonnetflorent@gmail.com'),
+  ('chronotrade2926@gmail.com')
 on conflict (email) do nothing;
 
 update public.users
 set role = 'super_admin', updated_at = now()
-where lower(email) in ('bouchonneflorent@gmail.com', 'chronotrade29-26@gmail.com');
+where lower(email) in ('bouchonnetflorent@gmail.com', 'chronotrade2926@gmail.com');
 
 create or replace function public.is_admin_user()
 returns boolean
