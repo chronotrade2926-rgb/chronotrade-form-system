@@ -1,0 +1,5 @@
+server.backup-*.js
+data/
+quotes/
+.env
+.env.*
