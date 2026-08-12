@@ -1828,6 +1828,7 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     status: nextStatus,
     detected_category: analysis.category || need.detected_category,
     detected_objective: analysis.desired_outcome || need.detected_objective,
+    recommended_services: matches.map((match) => match.solution?.slug || match.slug || match.solution_slug || match.solution?.name || match.name).filter(Boolean).slice(0, 5),
     urgency: analysis.urgency === "unknown" ? need.urgency || null : analysis.urgency,
     budget_range: analysis.budget_if_mentioned || need.budget_range || null,
     is_unmet: nextStatus === "UNRESOLVED",
