@@ -1895,6 +1895,23 @@ async function requireSupabaseAdmin(req, res) {
   return { user, profile };
 }
 
+async function requireSupabaseSuperAdmin(req, res) {
+  const user = await supabaseAuthUser(req);
+  if (!user?.id) {
+    jsonResponse(res, 401, { ok: false, error: "Connexion super-admin requise." });
+    return null;
+  }
+  const role = await supabaseSelect("users", { select: "id,email,role", id: `eq.${user.id}`, limit: "1" });
+  const profile = role.ok && Array.isArray(role.data) ? role.data[0] : null;
+  const email = String(profile?.email || user.email || "").trim().toLowerCase();
+  const allowed = email === "bouchonnetflorent@gmail.com" || email === "chronotrade2926@gmail.com";
+  if (profile?.role !== "super_admin" || !allowed) {
+    jsonResponse(res, 403, { ok: false, error: "Acces super-admin proprietaire requis." });
+    return null;
+  }
+  return { user, profile };
+}
+
 async function requireSupabaseUser(req, res) {
   const user = await supabaseAuthUser(req);
   if (!user?.id) {
@@ -3967,7 +3984,7 @@ async function handleListProductIntakes(req, res) {
 }
 
 async function handleAdminProductSync(req, res) {
-  const admin = await requireSupabaseAdmin(req, res);
+  const admin = await requireSupabaseSuperAdmin(req, res);
   if (!admin) return;
   try {
     const fields = await readRequestBody(req);
