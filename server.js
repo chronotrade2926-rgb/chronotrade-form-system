@@ -1742,6 +1742,7 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     repeatability_score: analysis.repeatability_score,
     confidence: analysis.confidence_score,
     analysis_version: `${prompt.name || "need_analysis"}:${prompt.version || "v1"}`,
+    original_ai_output_reference: runId || null,
     user_type: cleanString(analysis.user_type),
     urgency: cleanString(analysis.urgency),
     budget_if_mentioned: cleanString(analysis.budget_if_mentioned),
@@ -2708,6 +2709,14 @@ async function handleResolveNeed(req, res) {
     return jsonResponse(res, 201, {
       ok: true,
       need: { id: need?.id || null, status: ai?.status || payload.status, ref: need?.id ? `REQ-${String(need.id).slice(0, 8).toUpperCase()}` : null },
+      understood: {
+        summary: ai?.analysis?.summary || null,
+        primaryProblem: ai?.analysis?.primary_problem || null,
+        desiredOutcome: ai?.analysis?.desired_outcome || null,
+        category: ai?.analysis?.category || payload.detected_category || null,
+        confidence: ai?.analysis?.confidence_score ?? null
+      },
+      nextAction: ai?.analysis?.desired_outcome || ai?.analysis?.user_facing_suggestion || null,
       suggestion: ai?.analysis?.user_facing_suggestion || null,
       questions: ai?.analysis?.suggested_questions || [],
       matches: (ai?.matches || []).map((match) => ({
@@ -2806,6 +2815,55 @@ async function handleResolveClarification(req, res, needId) {
   }
 }
 
+async function handleResolveCorrection(req, res, needId) {
+  try {
+    const body = await readRequestBody(req);
+    const authUser = await supabaseAuthUser(req);
+    const correctedText = cleanString(body.corrected_text || body.correctedText || body.answer);
+    if (correctedText.length < 8) return jsonResponse(res, 422, { ok: false, error: "Correction trop courte." });
+    const lookup = await supabaseSelect("needs", { select: "id,user_id,session_id,status,title", id: `eq.${cleanString(needId)}`, limit: "1" });
+    const need = lookup.ok && Array.isArray(lookup.data) ? lookup.data[0] : null;
+    if (!need?.id) return jsonResponse(res, 404, { ok: false, error: "Demande introuvable." });
+    const sameSession = cleanString(body.session_id) && cleanString(body.session_id) === cleanString(need.session_id);
+    const ownsNeed = authUser?.id && authUser.id === need.user_id;
+    if (!sameSession && !ownsNeed) return jsonResponse(res, 403, { ok: false, error: "Cette correction ne peut pas etre ajoutee depuis cette session." });
+    const latestAnalysis = await supabaseSelect("need_analysis", { select: "summary", need_id: `eq.${need.id}`, order: "created_at.desc", limit: "1" });
+    const originalSummary = latestAnalysis.ok && Array.isArray(latestAnalysis.data) ? latestAnalysis.data[0]?.summary || "" : "";
+    const inserted = await supabaseInsert("need_analysis_corrections", {
+      need_id: need.id,
+      user_id: authUser?.id || null,
+      session_id: cleanString(body.session_id) || null,
+      correction_type: "user_understanding",
+      original_summary: originalSummary,
+      corrected_text: correctedText,
+      metadata: body.metadata && typeof body.metadata === "object" ? body.metadata : {}
+    });
+    if (!inserted.ok) return jsonResponse(res, 500, { ok: false, error: inserted.message });
+    await supabaseUpdate("need_analysis", {
+      human_correction: correctedText,
+      human_validated: false,
+      needs_human_review: true,
+      updated_at: new Date().toISOString()
+    }, { need_id: `eq.${need.id}` }, { returnRepresentation: false });
+    await supabaseUpdate("needs", {
+      status: "NEEDS_HUMAN_REVIEW",
+      updated_at: new Date().toISOString()
+    }, { id: `eq.${need.id}` }, { returnRepresentation: false });
+    await recordNeedEvent(need.id, need.user_id || authUser?.id || null, "analysis_corrected", { to_status: "NEEDS_HUMAN_REVIEW", note: "Correction utilisateur sur ce que ChronoTrade a compris.", metadata: { correctionLength: correctedText.length } });
+    await recordSiteEvent({
+      userId: authUser?.id || null,
+      sessionId: cleanString(body.session_id) || null,
+      eventType: "analysis_corrected",
+      entityType: "need",
+      entityId: need.id,
+      metadata: { source: "resolve_result" }
+    });
+    return jsonResponse(res, 201, { ok: true });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
 async function handleResolveContact(req, res, needId) {
   try {
     const body = await readRequestBody(req);
@@ -2894,15 +2952,24 @@ async function handleSiteEvent(req, res) {
     const body = await readRequestBody(req);
     const authUser = await supabaseAuthUser(req);
     const allowed = new Set([
+      "home_viewed",
+      "need_input_focused",
       "need_started",
       "need_saved",
+      "need_submitted",
+      "analysis_corrected",
       "solution_impression",
       "solution_clicked",
+      "solution_selected",
       "social_follow_clicked",
       "community_post_created",
       "same_need_clicked",
+      "idea_followed",
       "comment_created",
-      "account_created_from_need"
+      "account_created_from_need",
+      "chronolab_viewed",
+      "beta_joined",
+      "update_viewed"
     ]);
     const eventType = cleanString(body.event_type || body.eventType);
     if (!allowed.has(eventType)) return jsonResponse(res, 422, { ok: false, error: "Evenement non autorise." });
@@ -4378,6 +4445,9 @@ createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/api/resolve/needs") return handleResolveNeed(req, res);
   if (req.method === "POST" && url.pathname.startsWith("/api/resolve/needs/") && url.pathname.endsWith("/clarification")) {
     return handleResolveClarification(req, res, url.pathname.replace("/api/resolve/needs/", "").replace("/clarification", ""));
+  }
+  if (req.method === "POST" && url.pathname.startsWith("/api/resolve/needs/") && url.pathname.endsWith("/correction")) {
+    return handleResolveCorrection(req, res, url.pathname.replace("/api/resolve/needs/", "").replace("/correction", ""));
   }
   if (req.method === "POST" && url.pathname.startsWith("/api/resolve/needs/") && url.pathname.endsWith("/contact")) {
     return handleResolveContact(req, res, url.pathname.replace("/api/resolve/needs/", "").replace("/contact", ""));
