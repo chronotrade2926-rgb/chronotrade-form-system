@@ -4034,6 +4034,13 @@ async function handleAnalyseExpressIntake(req, res) {
       createdAt: now,
       updatedAt: now
     };
+    const errors = {};
+    if (!intake.fullName) errors.nom = "Champ obligatoire.";
+    if (!isEmail(intake.email)) errors.email = "Email invalide.";
+    if (intake.currentSituation.length < 12) errors.situation = "Expliquez un peu plus votre situation.";
+    if (intake.goal.length < 12) errors.objectif = "Expliquez un peu plus l'objectif.";
+    if (!intake.priority) errors.priorite = "Champ obligatoire.";
+    if (Object.keys(errors).length) return jsonResponse(res, 422, { ok: false, errors });
     const intakes = await readJson(productIntakesPath, []);
     intakes.unshift(intake);
     await writeJson(productIntakesPath, intakes);
