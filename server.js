@@ -1701,6 +1701,14 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
   });
   const runId = Array.isArray(startedRun.data) ? startedRun.data[0]?.id : startedRun.data?.id;
   await recordNeedEvent(need.id, need.user_id, "ai_analysis_started", { metadata: { model: prompt.model || OPENAI_NEED_MODEL, enabled: Boolean(OPENAI_API_KEY) } });
+  await recordSiteEvent({
+    userId: need.user_id || null,
+    sessionId: need.session_id || null,
+    eventType: "need_analysis_started",
+    entityType: "need",
+    entityId: need.id,
+    metadata: { model: prompt.model || OPENAI_NEED_MODEL, enabled: Boolean(OPENAI_API_KEY) }
+  });
   let analysis = null;
   let modelResult = null;
   let aiStatus = "completed";
@@ -1781,6 +1789,14 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     updated_at: new Date().toISOString()
   }, { id: `eq.${need.id}` }, { returnRepresentation: false });
   await recordNeedEvent(need.id, need.user_id, aiStatus === "completed" ? "ai_analysis_completed" : "ai_analysis_failed", { to_status: nextStatus, note: errorMessage || null, metadata: { confidence: analysis.confidence_score, matches: matches.length } });
+  await recordSiteEvent({
+    userId: need.user_id || null,
+    sessionId: need.session_id || null,
+    eventType: aiStatus === "completed" ? "need_analysis_completed" : "need_analysis_failed",
+    entityType: "need",
+    entityId: need.id,
+    metadata: { confidence: analysis.confidence_score, matches: matches.length, status: nextStatus, runStatus: aiStatus }
+  });
   if (matches.length) await recordNeedEvent(need.id, need.user_id, "ai_match_generated", { metadata: { bestScore, matches: matches.map((match) => ({ solution_id: match.solution_id, score: match.score })) } });
   if (runId) {
     await supabaseUpdate("ai_analysis_runs", {
@@ -2955,6 +2971,9 @@ async function handleSiteEvent(req, res) {
       "home_viewed",
       "need_input_focused",
       "need_started",
+      "need_analysis_started",
+      "need_analysis_completed",
+      "need_analysis_failed",
       "need_saved",
       "need_submitted",
       "analysis_corrected",
