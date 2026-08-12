@@ -276,6 +276,10 @@ function cleanString(value) {
   return String(value ?? "").trim();
 }
 
+function isEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanString(value).toLowerCase());
+}
+
 function normalizePayload(payload) {
   const normalized = {};
   const keys = new Set([...commonFields, ...Object.keys(payload || {})]);
@@ -2802,6 +2806,122 @@ async function handleResolveClarification(req, res, needId) {
   }
 }
 
+async function handleResolveContact(req, res, needId) {
+  try {
+    const body = await readRequestBody(req);
+    const authUser = await supabaseAuthUser(req);
+    const email = cleanString(body.email || body.contact_email || authUser?.email).toLowerCase();
+    if (!isEmail(email)) return jsonResponse(res, 422, { ok: false, error: "Email invalide." });
+    const lookup = await supabaseSelect("needs", { select: "id,user_id,session_id,status,raw_text,title,contact_name,contact_email,email", id: `eq.${cleanString(needId)}`, limit: "1" });
+    const need = lookup.ok && Array.isArray(lookup.data) ? lookup.data[0] : null;
+    if (!need?.id) return jsonResponse(res, 404, { ok: false, error: "Demande introuvable." });
+    const sameSession = cleanString(body.session_id) && cleanString(body.session_id) === cleanString(need.session_id);
+    const ownsNeed = authUser?.id && authUser.id === need.user_id;
+    if (!sameSession && !ownsNeed) return jsonResponse(res, 403, { ok: false, error: "Cette demande ne peut pas etre modifiee depuis cette session." });
+    const wantsAlert = Boolean(body.alert_requested || body.notify || body.wants_alert);
+    const contactPermission = body.consent_marketing ? "marketing" : wantsAlert ? "solution_updates" : "service_only";
+    const updated = await supabaseUpdate("needs", {
+      contact_email: email,
+      email,
+      wants_contact: true,
+      contact_permission: contactPermission,
+      consent_marketing: Boolean(body.consent_marketing),
+      alert_requested: wantsAlert,
+      alert_requested_at: wantsAlert ? new Date().toISOString() : null,
+      updated_at: new Date().toISOString()
+    }, { id: `eq.${need.id}` }, { returnRepresentation: false });
+    if (!updated.ok) return jsonResponse(res, 500, { ok: false, error: updated.message || "Mise a jour impossible." });
+    await recordNeedEvent(need.id, need.user_id || authUser?.id || null, "email_provided", { metadata: { permission: contactPermission, alertRequested: wantsAlert } });
+    if (wantsAlert) await recordNeedEvent(need.id, need.user_id || authUser?.id || null, "solution_alert_requested", { metadata: { permission: contactPermission } });
+    const clientEmail = await sendResolveClientConfirmation({ ...need, contact_email: email, email }, {});
+    return jsonResponse(res, 200, { ok: true, clientEmail });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+async function handleResolveSave(req, res, needId) {
+  try {
+    const body = await readRequestBody(req);
+    const authUser = await supabaseAuthUser(req);
+    if (!authUser?.id) return jsonResponse(res, 401, { ok: false, error: "Compte requis pour sauvegarder la demande." });
+    const lookup = await supabaseSelect("needs", { select: "id,user_id,session_id,status,title", id: `eq.${cleanString(needId)}`, limit: "1" });
+    const need = lookup.ok && Array.isArray(lookup.data) ? lookup.data[0] : null;
+    if (!need?.id) return jsonResponse(res, 404, { ok: false, error: "Demande introuvable." });
+    const sameSession = cleanString(body.session_id) && cleanString(body.session_id) === cleanString(need.session_id);
+    const unclaimed = !need.user_id;
+    const ownsNeed = need.user_id === authUser.id;
+    if (!ownsNeed && !(unclaimed && sameSession)) return jsonResponse(res, 403, { ok: false, error: "Cette demande n'appartient pas a cette session." });
+    const savePayload = {
+      user_id: authUser.id,
+      saved_to_account_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    if (!need.user_id) savePayload.account_attached_at = new Date().toISOString();
+    const updated = await supabaseUpdate("needs", savePayload, { id: `eq.${need.id}` }, { returnRepresentation: false });
+    if (!updated.ok) return jsonResponse(res, 500, { ok: false, error: updated.message || "Sauvegarde impossible." });
+    await recordNeedEvent(need.id, authUser.id, "need_saved", { metadata: { source: "resolve_after_submit" } });
+    if (!need.user_id) await recordSiteEvent({
+      userId: authUser.id,
+      sessionId: cleanString(body.session_id) || null,
+      eventType: "account_created_from_need",
+      entityType: "need",
+      entityId: need.id,
+      metadata: { source: "resolve_after_submit" }
+    });
+    return jsonResponse(res, 200, { ok: true });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+async function recordSiteEvent({ userId = null, sessionId = null, eventType, entityType = null, entityId = null, path = null, referrer = null, metadata = {} } = {}) {
+  if (!eventType) return { ok: false, message: "eventType absent." };
+  return supabaseInsert("site_events", {
+    user_id: userId || null,
+    session_id: sessionId || null,
+    event_type: cleanString(eventType).slice(0, 90),
+    entity_type: entityType ? cleanString(entityType).slice(0, 80) : null,
+    entity_id: entityId || null,
+    path: path ? cleanString(path).slice(0, 400) : null,
+    referrer: referrer ? cleanString(referrer).slice(0, 600) : null,
+    metadata: metadata && typeof metadata === "object" ? metadata : {}
+  });
+}
+
+async function handleSiteEvent(req, res) {
+  try {
+    const body = await readRequestBody(req);
+    const authUser = await supabaseAuthUser(req);
+    const allowed = new Set([
+      "need_started",
+      "need_saved",
+      "solution_impression",
+      "solution_clicked",
+      "social_follow_clicked",
+      "community_post_created",
+      "same_need_clicked",
+      "comment_created",
+      "account_created_from_need"
+    ]);
+    const eventType = cleanString(body.event_type || body.eventType);
+    if (!allowed.has(eventType)) return jsonResponse(res, 422, { ok: false, error: "Evenement non autorise." });
+    const event = await recordSiteEvent({
+      userId: authUser?.id || null,
+      sessionId: cleanString(body.session_id) || null,
+      eventType,
+      entityType: cleanString(body.entity_type || body.entityType) || null,
+      entityId: cleanString(body.entity_id || body.entityId) || null,
+      path: cleanString(body.path) || null,
+      referrer: cleanString(body.referrer) || null,
+      metadata: body.metadata && typeof body.metadata === "object" ? body.metadata : {}
+    });
+    return jsonResponse(res, event.ok ? 201 : 500, { ok: Boolean(event.ok), error: event.ok ? null : event.message });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
 async function handleAdminAnalyzeNeed(req, res, needId) {
   const admin = await requireSupabaseAdmin(req, res);
   if (!admin) return;
@@ -4259,6 +4379,13 @@ createServer((req, res) => {
   if (req.method === "POST" && url.pathname.startsWith("/api/resolve/needs/") && url.pathname.endsWith("/clarification")) {
     return handleResolveClarification(req, res, url.pathname.replace("/api/resolve/needs/", "").replace("/clarification", ""));
   }
+  if (req.method === "POST" && url.pathname.startsWith("/api/resolve/needs/") && url.pathname.endsWith("/contact")) {
+    return handleResolveContact(req, res, url.pathname.replace("/api/resolve/needs/", "").replace("/contact", ""));
+  }
+  if (req.method === "POST" && url.pathname.startsWith("/api/resolve/needs/") && url.pathname.endsWith("/save")) {
+    return handleResolveSave(req, res, url.pathname.replace("/api/resolve/needs/", "").replace("/save", ""));
+  }
+  if (req.method === "POST" && url.pathname === "/api/events") return handleSiteEvent(req, res);
   if (req.method === "POST" && url.pathname === "/api/privacy/request") return handlePrivacyRequest(req, res);
   if (req.method === "POST" && url.pathname === "/api/forms/devis") return handleLiveForm(req, res, "devis");
   if (req.method === "POST" && url.pathname === "/api/forms/sur-mesure") return handleLiveForm(req, res, "sur-mesure");
