@@ -22,7 +22,12 @@ const SUPABASE_URL = normalizeSupabaseUrl(process.env.SUPABASE_URL || process.en
 const SUPABASE_REST_URL = SUPABASE_URL ? `${SUPABASE_URL}/rest/v1` : "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_NEED_MODEL = process.env.OPENAI_NEED_MODEL || "gpt-4.1-mini";
+const OPENAI_NEED_MODEL = process.env.OPENAI_NEED_MODEL || "gpt-5.6-luna";
+const OPENAI_NEED_REASONING_EFFORT = process.env.OPENAI_NEED_REASONING_EFFORT || "low";
+const OPENAI_NEED_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_NEED_MAX_OUTPUT_TOKENS || 900);
+const MAX_NEED_TEXT_CHARS = Number(process.env.MAX_NEED_TEXT_CHARS || 1800);
+const OPENAI_LUNA_INPUT_USD_PER_1M = Number(process.env.OPENAI_LUNA_INPUT_USD_PER_1M || 1);
+const OPENAI_LUNA_OUTPUT_USD_PER_1M = Number(process.env.OPENAI_LUNA_OUTPUT_USD_PER_1M || 6);
 const AI_NEED_TIMEOUT_MS = Number(process.env.AI_NEED_TIMEOUT_MS || 12000);
 const AI_MATCH_THRESHOLD_HIGH = Number(process.env.AI_MATCH_THRESHOLD_HIGH || 0.82);
 const AI_MATCH_THRESHOLD_LOW = Number(process.env.AI_MATCH_THRESHOLD_LOW || 0.55);
@@ -1442,7 +1447,7 @@ const needAnalysisSchema = {
     "summary", "primary_problem", "secondary_problems", "desired_outcome", "user_type", "industry",
     "category", "subcategory", "urgency", "budget_if_mentioned", "constraints", "solution_tags",
     "commercial_intent", "repeatability_score", "estimated_complexity", "confidence_score",
-    "needs_human_review", "safe_to_process", "rejection_reason_if_any", "suggested_questions",
+    "needs_clarification", "needs_human_review", "safe_to_process", "moderation_reason", "rejection_reason_if_any", "suggested_questions",
     "user_facing_suggestion"
   ],
   properties: {
@@ -1462,8 +1467,10 @@ const needAnalysisSchema = {
     repeatability_score: { type: "number" },
     estimated_complexity: { type: "string", enum: ["simple", "medium", "advanced", "complex", "unknown"] },
     confidence_score: { type: "number" },
+    needs_clarification: { type: "boolean" },
     needs_human_review: { type: "boolean" },
     safe_to_process: { type: "boolean" },
+    moderation_reason: { type: "string" },
     rejection_reason_if_any: { type: "string" },
     suggested_questions: { type: "array", items: { type: "string" } },
     user_facing_suggestion: { type: "string" }
@@ -1521,7 +1528,9 @@ function parseOpenAIJsonResponse(payload) {
 async function callNeedAnalysisModel({ need, prompt }) {
   if (!OPENAI_API_KEY) return { skipped: true, reason: "OPENAI_API_KEY missing" };
   const controller = new AbortController();
+  const startedAt = Date.now();
   const timeout = setTimeout(() => controller.abort(), AI_NEED_TIMEOUT_MS);
+  const modelInputText = cleanString(need.raw_text).slice(0, MAX_NEED_TEXT_CHARS);
   try {
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -1532,6 +1541,8 @@ async function callNeedAnalysisModel({ need, prompt }) {
       },
       body: JSON.stringify({
         model: prompt.model || OPENAI_NEED_MODEL,
+        reasoning: { effort: OPENAI_NEED_REASONING_EFFORT },
+        max_output_tokens: OPENAI_NEED_MAX_OUTPUT_TOKENS,
         input: [
           {
             role: "system",
@@ -1546,7 +1557,7 @@ async function callNeedAnalysisModel({ need, prompt }) {
           {
             role: "user",
             content: [
-              `Besoin brut: ${need.raw_text}`,
+              `Besoin brut: ${modelInputText}`,
               `Profil: ${need.user_type || "non precise"}`,
               `Secteur: ${need.industry || "non precise"}`,
               `Objectif detecte: ${need.objective || "non precise"}`,
@@ -1566,10 +1577,28 @@ async function callNeedAnalysisModel({ need, prompt }) {
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.error?.message || `OpenAI ${response.status}`);
-    return { ok: true, payload, analysis: parseOpenAIJsonResponse(payload) };
+    return { ok: true, payload, analysis: parseOpenAIJsonResponse(payload), durationMs: Date.now() - startedAt };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function openAIUsageSummary(payload = {}, durationMs = null, model = OPENAI_NEED_MODEL) {
+  const usage = payload.usage || {};
+  const inputTokens = Number(usage.input_tokens || usage.prompt_tokens || 0);
+  const outputTokens = Number(usage.output_tokens || usage.completion_tokens || 0);
+  const totalTokens = Number(usage.total_tokens || inputTokens + outputTokens || 0);
+  const estimatedCostUsd = model === "gpt-5.6-luna"
+    ? (inputTokens / 1_000_000) * OPENAI_LUNA_INPUT_USD_PER_1M + (outputTokens / 1_000_000) * OPENAI_LUNA_OUTPUT_USD_PER_1M
+    : null;
+  return {
+    input_tokens: inputTokens || null,
+    output_tokens: outputTokens || null,
+    total_tokens: totalTokens || null,
+    duration_ms: Number.isFinite(durationMs) ? durationMs : null,
+    estimated_cost_usd: estimatedCostUsd == null ? null : Number(estimatedCostUsd.toFixed(8)),
+    raw: usage
+  };
 }
 
 function fallbackNeedAnalysis(need, risk = null) {
@@ -1605,8 +1634,10 @@ function fallbackNeedAnalysis(need, risk = null) {
     repeatability_score: tags.length ? 0.55 : 0.25,
     estimated_complexity: "unknown",
     confidence_score: risk ? 0.2 : (tags.length ? 0.62 : 0.35),
+    needs_clarification: tags.length === 0,
     needs_human_review: Boolean(risk) || tags.length === 0,
     safe_to_process: !risk,
+    moderation_reason: risk?.reason || "",
     rejection_reason_if_any: risk?.reason || "",
     suggested_questions: tags.length ? [] : ["Quel resultat concret voulez-vous obtenir en priorite ?"],
     user_facing_suggestion: risk
@@ -1743,6 +1774,10 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
   analysis.secondary_problems = arrayOfCleanStrings(analysis.secondary_problems, 8);
   analysis.solution_tags = arrayOfCleanStrings(analysis.solution_tags, 12);
   analysis.suggested_questions = arrayOfCleanStrings(analysis.suggested_questions, 3);
+  analysis.needs_clarification = Boolean(analysis.needs_clarification || analysis.suggested_questions.length);
+  analysis.moderation_reason = cleanString(analysis.moderation_reason || analysis.rejection_reason_if_any || "");
+  const modelUsed = prompt.model || OPENAI_NEED_MODEL;
+  const usageSummary = openAIUsageSummary(modelResult?.payload || {}, modelResult?.durationMs || null, modelUsed);
 
   const analysisInsert = await supabaseInsert("need_analysis", {
     need_id: need.id,
@@ -1764,8 +1799,10 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     budget_if_mentioned: cleanString(analysis.budget_if_mentioned),
     solution_tags: analysis.solution_tags,
     commercial_intent: cleanString(analysis.commercial_intent),
+    needs_clarification: Boolean(analysis.needs_clarification),
     needs_human_review: Boolean(analysis.needs_human_review),
     safe_to_process: Boolean(analysis.safe_to_process),
+    moderation_reason: analysis.moderation_reason,
     rejection_reason_if_any: cleanString(analysis.rejection_reason_if_any),
     user_facing_suggestion: cleanString(analysis.user_facing_suggestion),
     suggested_questions: analysis.suggested_questions,
@@ -1813,7 +1850,13 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
       needs_human_review: Boolean(analysis.needs_human_review),
       safe_to_process: Boolean(analysis.safe_to_process),
       error_message: errorMessage || null,
-      usage: modelResult?.payload?.usage || {},
+      duration_ms: usageSummary.duration_ms,
+      input_tokens: usageSummary.input_tokens,
+      output_tokens: usageSummary.output_tokens,
+      total_tokens: usageSummary.total_tokens,
+      estimated_cost_usd: usageSummary.estimated_cost_usd,
+      call_count: OPENAI_API_KEY && modelResult?.payload ? 1 : 0,
+      usage: usageSummary,
       result: { analysis, matches: matches.map((match) => ({ solution_id: match.solution_id, score: match.score, confidence_band: match.confidence_band })) },
       completed_at: new Date().toISOString()
     }, { id: `eq.${runId}` }, { returnRepresentation: false });
@@ -4309,7 +4352,7 @@ function handleHealth(res) {
   jsonResponse(res, 200, {
     ok: true,
     service: "chronotrade-form-system",
-    version: "phase-5-need-engine-events",
+    version: "phase-5-luna-need-analysis",
     checkedAt: new Date().toISOString(),
     integrations: {
       stripePublicKey: Boolean(STRIPE_PUBLISHABLE_KEY),
