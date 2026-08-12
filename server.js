@@ -4299,10 +4299,17 @@ async function handlePublicPromotions(res) {
 }
 
 function handleHealth(res) {
+  const rawSupabaseUrl = cleanUrl(process.env.SUPABASE_URL || process.env.PUBLIC_SUPABASE_URL || process.env.VITE_SUPABASE_URL || "");
+  let supabaseHost = "";
+  try {
+    supabaseHost = SUPABASE_URL ? new URL(SUPABASE_URL).host : "";
+  } catch {
+    supabaseHost = "invalid-url";
+  }
   jsonResponse(res, 200, {
     ok: true,
     service: "chronotrade-form-system",
-    version: "phase-5-account-commerce",
+    version: "phase-5-need-engine-events",
     checkedAt: new Date().toISOString(),
     integrations: {
       stripePublicKey: Boolean(STRIPE_PUBLISHABLE_KEY),
@@ -4314,6 +4321,11 @@ function handleHealth(res) {
       supabaseServiceRole: Boolean(SUPABASE_SERVICE_ROLE_KEY),
       openaiNeedAnalysis: Boolean(OPENAI_API_KEY),
       outlookGraph: Boolean(process.env.MICROSOFT_GRAPH_TOKEN || (process.env.MICROSOFT_CLIENT_ID && process.env.MICROSOFT_REFRESH_TOKEN))
+    },
+    diagnostics: {
+      supabaseHost,
+      supabaseUrlNormalized: Boolean(rawSupabaseUrl && rawSupabaseUrl !== SUPABASE_URL),
+      supabaseRestUrlReady: Boolean(SUPABASE_REST_URL && SUPABASE_REST_URL.endsWith("/rest/v1"))
     }
   });
 }
