@@ -1844,6 +1844,39 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     metadata: { confidence: analysis.confidence_score, matches: matches.length, status: nextStatus, runStatus: aiStatus }
   });
   if (matches.length) await recordNeedEvent(need.id, need.user_id, "ai_match_generated", { metadata: { bestScore, matches: matches.map((match) => ({ solution_id: match.solution_id, score: match.score })) } });
+  if (matches.length) {
+    await recordNeedEvent(need.id, need.user_id, "solution_proposed", { metadata: { bestScore, matches: matches.map((match) => ({ solution_id: match.solution_id, score: match.score, rank: match.rank })) } });
+    await recordSiteEvent({
+      userId: need.user_id || null,
+      sessionId: need.session_id || null,
+      eventType: "solution_proposed",
+      entityType: "need",
+      entityId: need.id,
+      metadata: { bestScore, matches: matches.length, status: nextStatus }
+    });
+  }
+  if (!analysis.safe_to_process) {
+    await recordNeedEvent(need.id, need.user_id, "need_rejected", { to_status: nextStatus, metadata: { reason: analysis.moderation_reason || analysis.rejection_reason_if_any || "unsafe" } });
+    await recordSiteEvent({
+      userId: need.user_id || null,
+      sessionId: need.session_id || null,
+      eventType: "need_rejected",
+      entityType: "need",
+      entityId: need.id,
+      metadata: { reason: analysis.moderation_reason || analysis.rejection_reason_if_any || "unsafe", status: nextStatus }
+    });
+  }
+  if (nextStatus === "UNRESOLVED") {
+    await recordNeedEvent(need.id, need.user_id, "no_solution_found", { to_status: nextStatus, metadata: { category: analysis.category || null, tags: analysis.solution_tags || [] } });
+    await recordSiteEvent({
+      userId: need.user_id || null,
+      sessionId: need.session_id || null,
+      eventType: "no_solution_found",
+      entityType: "need",
+      entityId: need.id,
+      metadata: { category: analysis.category || null, tags: analysis.solution_tags || [] }
+    });
+  }
   if (runId) {
     await supabaseUpdate("ai_analysis_runs", {
       status: aiStatus,
@@ -2782,6 +2815,18 @@ async function handleResolveNeed(req, res) {
     if (need?.id && payload.contact_email) await recordNeedEvent(need.id, payload.user_id, "email_provided", { metadata: { permission: payload.contact_permission } });
     if (need?.id && ai?.matches?.length) await recordNeedEvent(need.id, payload.user_id, "solution_suggested", { metadata: { count: ai.matches.length, bestScore: ai.matches[0]?.score || 0 } });
     if (need?.id && (ai?.status || payload.status) === "UNRESOLVED") await recordNeedEvent(need.id, payload.user_id, "need_unresolved", { metadata: { reason: "no_current_solution" } });
+    let similarCount = 0;
+    const categoryForSimilarity = cleanString(ai?.analysis?.category || payload.detected_category);
+    if (categoryForSimilarity) {
+      const similar = await supabaseSelect("needs", {
+        select: "id",
+        detected_category: `eq.${categoryForSimilarity}`,
+        limit: "100"
+      });
+      similarCount = similar.ok && Array.isArray(similar.data)
+        ? Math.max(0, similar.data.filter((row) => row.id !== need?.id).length)
+        : 0;
+    }
     const clientEmail = await sendResolveClientConfirmation({ ...payload, id: need?.id }, ai);
     if (need?.id) {
       await supabaseUpdate("needs", {
@@ -2804,6 +2849,7 @@ async function handleResolveNeed(req, res) {
       nextAction: ai?.analysis?.desired_outcome || ai?.analysis?.user_facing_suggestion || null,
       suggestion: ai?.analysis?.user_facing_suggestion || null,
       questions: ai?.analysis?.suggested_questions || [],
+      similarCount,
       matches: (ai?.matches || []).map((match) => ({
         solutionId: match.solution_id,
         score: match.score,
@@ -2884,6 +2930,12 @@ async function handleResolveClarification(req, res, needId) {
     const question = cleanString(body.question);
     const answer = cleanString(body.answer);
     if (!question || !answer) return jsonResponse(res, 422, { ok: false, error: "Question et reponse requises." });
+    const lookup = await supabaseSelect("needs", { select: "*", id: `eq.${cleanString(needId)}`, limit: "1" });
+    const need = lookup.ok && Array.isArray(lookup.data) ? lookup.data[0] : null;
+    if (!need?.id) return jsonResponse(res, 404, { ok: false, error: "Demande introuvable." });
+    const sameSession = cleanString(body.session_id) && cleanString(body.session_id) === cleanString(need.session_id);
+    const ownsNeed = authUser?.id && authUser.id === need.user_id;
+    if (!sameSession && !ownsNeed) return jsonResponse(res, 403, { ok: false, error: "Cette precision ne peut pas etre ajoutee depuis cette session." });
     const inserted = await supabaseInsert("need_clarifications", {
       need_id: cleanString(needId),
       user_id: authUser?.id || null,
@@ -2894,7 +2946,43 @@ async function handleResolveClarification(req, res, needId) {
     });
     if (!inserted.ok) return jsonResponse(res, 500, { ok: false, error: inserted.message });
     await recordNeedEvent(cleanString(needId), authUser?.id || null, "clarification_answered", { metadata: { question } });
-    return jsonResponse(res, 201, { ok: true });
+    await supabaseUpdate("needs", {
+      status: "ANALYZING",
+      metadata: {
+        ...(need.metadata || {}),
+        latest_clarification: { question, answer, received_at: new Date().toISOString() }
+      },
+      updated_at: new Date().toISOString()
+    }, { id: `eq.${need.id}` }, { returnRepresentation: false });
+    const enrichedNeed = {
+      ...need,
+      raw_text: `${need.raw_text}\n\nPrecision utilisateur: ${question}\n${answer}`,
+      status: "ANALYZING"
+    };
+    const ai = await analyzeNeedAfterSubmission(enrichedNeed, detectResolveRiskServer(enrichedNeed.raw_text));
+    return jsonResponse(res, 201, {
+      ok: true,
+      status: ai?.status || "ANALYZING",
+      understood: {
+        summary: ai?.analysis?.summary || null,
+        primaryProblem: ai?.analysis?.primary_problem || null,
+        desiredOutcome: ai?.analysis?.desired_outcome || null,
+        category: ai?.analysis?.category || null,
+        confidence: ai?.analysis?.confidence_score ?? null
+      },
+      questions: ai?.analysis?.suggested_questions || [],
+      matches: (ai?.matches || []).map((match) => ({
+        solutionId: match.solution_id,
+        score: match.score,
+        confidenceBand: match.confidence_band,
+        name: match.solution?.name || "",
+        slug: match.solution?.slug || "",
+        type: match.solution?.type || "",
+        productId: match.solution?.product_id || null,
+        reason: match.user_facing_copy || match.match_reason || ""
+      })),
+      noCurrentSolution: (ai?.status || "") === "UNRESOLVED"
+    });
   } catch (error) {
     return jsonResponse(res, 500, { ok: false, error: error.message });
   }
@@ -3046,6 +3134,13 @@ async function handleSiteEvent(req, res) {
       "need_saved",
       "need_submitted",
       "analysis_corrected",
+      "clarification_answered",
+      "solution_proposed",
+      "solution_accepted",
+      "solution_rejected",
+      "problem_resolved",
+      "no_solution_found",
+      "need_rejected",
       "solution_impression",
       "solution_clicked",
       "solution_selected",
