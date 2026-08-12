@@ -18,7 +18,8 @@ const productIntakesPath = join(dataDir, "product-intakes.json");
 const PORT = Number(process.env.PORT || 3030);
 const PUBLIC_BASE_URL = cleanUrl(process.env.PUBLIC_BASE_URL || "");
 const SITE_ORIGIN = process.env.SITE_ORIGIN || "https://chronotradehub.com";
-const SUPABASE_URL = cleanUrl(process.env.SUPABASE_URL || process.env.PUBLIC_SUPABASE_URL || process.env.VITE_SUPABASE_URL || "");
+const SUPABASE_URL = normalizeSupabaseUrl(process.env.SUPABASE_URL || process.env.PUBLIC_SUPABASE_URL || process.env.VITE_SUPABASE_URL || "");
+const SUPABASE_REST_URL = SUPABASE_URL ? `${SUPABASE_URL}/rest/v1` : "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_NEED_MODEL = process.env.OPENAI_NEED_MODEL || "gpt-4.1-mini";
@@ -220,6 +221,13 @@ function corsHeaders() {
 
 function cleanUrl(value) {
   return String(value || "").replace(/\/+$/, "");
+}
+
+function normalizeSupabaseUrl(value) {
+  return cleanUrl(value)
+    .replace(/\/rest\/v1$/i, "")
+    .replace(/\/auth\/v1$/i, "")
+    .replace(/\/storage\/v1$/i, "");
 }
 
 async function readJson(path, fallback) {
@@ -1218,7 +1226,7 @@ async function supabaseInsert(table, payload) {
     return { enabled: false, message: "Variables Supabase absentes." };
   }
 
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
+  const response = await fetch(`${SUPABASE_REST_URL}/${table}`, {
     method: "POST",
     headers: {
       apikey: SUPABASE_SERVICE_ROLE_KEY,
@@ -1251,7 +1259,7 @@ async function supabaseUpsert(table, payload, onConflict) {
     return { enabled: false, message: "Variables Supabase absentes." };
   }
 
-  const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
+  const url = new URL(`${SUPABASE_REST_URL}/${table}`);
   if (onConflict) url.searchParams.set("on_conflict", onConflict);
   const response = await fetch(url, {
     method: "POST",
@@ -1284,7 +1292,7 @@ async function supabaseUpsert(table, payload, onConflict) {
 async function supabaseUserIdByEmail(email) {
   const cleanEmail = String(email || "").trim().toLowerCase();
   if (!cleanEmail || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
-  const url = new URL(`${SUPABASE_URL}/rest/v1/users`);
+  const url = new URL(`${SUPABASE_REST_URL}/users`);
   url.searchParams.set("select", "id");
   url.searchParams.set("email", `eq.${cleanEmail}`);
   url.searchParams.set("limit", "1");
@@ -1345,7 +1353,7 @@ async function supabaseSelect(table, params = {}) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     return { enabled: false, ok: false, message: "Variables Supabase absentes." };
   }
-  const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
+  const url = new URL(`${SUPABASE_REST_URL}/${table}`);
   Object.entries(params).forEach(([key, value]) => {
     if (value !== undefined && value !== null) url.searchParams.set(key, value);
   });
@@ -1370,7 +1378,7 @@ async function supabaseUpdate(table, payload, filters = {}, options = {}) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     return { enabled: false, ok: false, message: "Variables Supabase absentes." };
   }
-  const url = new URL(`${SUPABASE_URL}/rest/v1/${table}`);
+  const url = new URL(`${SUPABASE_REST_URL}/${table}`);
   Object.entries(filters).forEach(([key, value]) => url.searchParams.set(key, value));
   const response = await fetch(url, {
     method: "PATCH",
