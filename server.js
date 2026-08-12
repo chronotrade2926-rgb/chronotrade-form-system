@@ -35,8 +35,10 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
 const STRIPE_ANALYSE_EXPRESS_PRICE_ID = process.env.STRIPE_ANALYSE_EXPRESS_PRICE_ID || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
-const GOOGLE_BUSINESS_REVIEW_URL = process.env.GOOGLE_BUSINESS_REVIEW_URL || "";
-const GOOGLE_BUSINESS_PROFILE_URL = process.env.GOOGLE_BUSINESS_PROFILE_URL || "";
+const DEFAULT_GOOGLE_BUSINESS_REVIEW_URL = "https://g.page/r/Ca68lNm5PPKMEBI/review";
+const DEFAULT_GOOGLE_BUSINESS_PROFILE_URL = "https://www.google.com/search?q=ChronoTrade&stick=H4sIAAAAAAAA_-NgU1I1qDAxMDMzM002Mk00Skw2SrW0MqiwSE4zMk5OskyxtDRJSk5MXcTK7ZxRlJ-XH1KUmJIKAEWe0Vw3AAAA&hl=en-GB&mat=CTspJ23EUm1vElcBa0lj_9drynJWHP_mInqOnE3FOgciqrOI6NsRrc3ucF-NBEohPBpBLGqcJlkTjF8ipfyCty-pMVgqLsuXWbCJDnNJr2HF_ufTz3iVOEM9NnnmWnzK9sA&authuser=1&ved=2ahUKEwipp_6nj4-WAxU_TqQEHdF_FBQQ-MgIegQIDxAh";
+const GOOGLE_BUSINESS_REVIEW_URL = normalizeGoogleReviewUrl(process.env.GOOGLE_BUSINESS_REVIEW_URL || DEFAULT_GOOGLE_BUSINESS_REVIEW_URL);
+const GOOGLE_BUSINESS_PROFILE_URL = cleanUrl(process.env.GOOGLE_BUSINESS_PROFILE_URL || DEFAULT_GOOGLE_BUSINESS_PROFILE_URL);
 const GOOGLE_BUSINESS_ACCOUNT_ID = process.env.GOOGLE_BUSINESS_ACCOUNT_ID || "";
 const GOOGLE_BUSINESS_LOCATION_ID = process.env.GOOGLE_BUSINESS_LOCATION_ID || "";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
@@ -226,6 +228,14 @@ function corsHeaders() {
 
 function cleanUrl(value) {
   return String(value || "").replace(/\/+$/, "");
+}
+
+function normalizeGoogleReviewUrl(value) {
+  const url = String(value || "").trim() || DEFAULT_GOOGLE_BUSINESS_REVIEW_URL;
+  return url
+    .replace("Ca68lNm5PPKMEBM", "Ca68lNm5PPKMEBI")
+    .replace(/\/review\/?$/i, "")
+    .replace(/\/+$/, "") + "/review";
 }
 
 function normalizeSupabaseUrl(value) {
