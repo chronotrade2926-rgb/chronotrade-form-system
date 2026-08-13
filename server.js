@@ -1759,6 +1759,175 @@ async function matchNeedSolutions(need, analysis) {
   return payloads;
 }
 
+function productToResolveSolution(product) {
+  const metadata = product?.metadata && typeof product.metadata === "object" ? product.metadata : {};
+  return {
+    id: product.id,
+    type: product.product_type === "app" ? "APP" : product.product_type === "automation" ? "AUTOMATION" : product.product_type === "service" ? "SERVICE" : product.product_type === "resource" ? "RESOURCE" : "PRODUCT",
+    name: product.title,
+    slug: product.slug,
+    description: [product.short_description, product.description].filter(Boolean).join(" "),
+    problems_solved: [
+      ...(Array.isArray(metadata.intents) ? metadata.intents : []),
+      ...(Array.isArray(metadata.catalogue_filters) ? metadata.catalogue_filters : []),
+      ...(Array.isArray(product.tags) ? product.tags : [])
+    ],
+    target_users: Array.isArray(metadata.target_users) ? metadata.target_users : [],
+    industries: Array.isArray(metadata.industries) ? metadata.industries : [],
+    price_model: product.pricing_model || "one_time",
+    price: product.price_cents == null ? null : Number(product.price_cents || 0) / 100,
+    recurring: product.pricing_model === "subscription",
+    internal_or_external: product.provider_type === "verified_partner" ? "partner" : "internal",
+    product_id: product.id,
+    active: product.status === "published",
+    public: product.status === "published",
+    metadata: { source: "product_publish_alert", product_type: product.product_type, ...(metadata || {}) }
+  };
+}
+
+async function upsertSolutionFromProduct(product) {
+  const solution = productToResolveSolution(product);
+  const result = await supabaseUpsert("solutions", {
+    type: solution.type,
+    name: solution.name,
+    slug: solution.slug,
+    description: solution.description,
+    problems_solved: solution.problems_solved,
+    target_users: solution.target_users,
+    industries: solution.industries,
+    price_model: solution.price_model,
+    price: solution.price,
+    recurring: solution.recurring,
+    internal_or_external: solution.internal_or_external,
+    product_id: solution.product_id,
+    active: solution.active,
+    public: solution.public,
+    metadata: solution.metadata,
+    updated_at: new Date().toISOString()
+  }, "slug");
+  if (!result.ok) return { ok: false, error: result.message, solution: null };
+  const lookup = await supabaseSelect("solutions", { select: "*", slug: `eq.${solution.slug}`, limit: "1" });
+  const dbSolution = lookup.ok && Array.isArray(lookup.data) ? lookup.data[0] : null;
+  return { ok: true, solution: dbSolution || solution, upsert: result };
+}
+
+function buildProductAlertEmail({ need, product, match, analysis }) {
+  const originalDate = need.created_at ? new Date(need.created_at).toLocaleDateString("fr-FR") : "une date precedente";
+  const productUrl = `${SITE_ORIGIN}/produit/?slug=${encodeURIComponent(product.slug)}`;
+  const freeStep = analysis?.user_facing_suggestion || "Commencez par relire votre besoin initial, notez le resultat attendu et choisissez une seule prochaine action a tester.";
+  return {
+    to: need.contact_email || need.email,
+    subject: `Une solution ChronoTrade peut correspondre a votre demande`,
+    text: [
+      "Bonjour,",
+      "",
+      `Vous aviez decrit un besoin sur ChronoTrade le ${originalDate} :`,
+      `"${need.raw_text || need.title || "Demande ChronoTrade"}"`,
+      "",
+      `Une solution vient d'etre publiee ou mise a jour : ${product.title}.`,
+      product.short_description || product.description || "",
+      "",
+      `Pourquoi elle peut correspondre : ${match.match_reason || "elle partage les memes signaux que votre demande initiale."}`,
+      "",
+      `Action gratuite avant de payer : ${freeStep}`,
+      "",
+      `Voir la solution : ${productUrl}`,
+      "",
+      "ChronoTrade"
+    ].filter(Boolean).join("\n"),
+    html: `<p>Bonjour,</p><p>Vous aviez decrit un besoin sur ChronoTrade le <strong>${escapeHtml(originalDate)}</strong> :</p><blockquote>${escapeHtml(need.raw_text || need.title || "Demande ChronoTrade")}</blockquote><p>Une solution vient d'etre publiee ou mise a jour : <strong>${escapeHtml(product.title)}</strong>.</p><p>${escapeHtml(product.short_description || product.description || "")}</p><p><strong>Pourquoi elle peut correspondre :</strong> ${escapeHtml(match.match_reason || "elle partage les memes signaux que votre demande initiale.")}</p><p><strong>Action gratuite avant de payer :</strong> ${escapeHtml(freeStep)}</p><p><a href="${escapeHtml(productUrl)}">Voir la solution ChronoTrade</a></p><p>ChronoTrade</p>`
+  };
+}
+
+async function notifyMatchingNeedsForProduct(product, { dryRun = false, limit = 80 } = {}) {
+  if (!product?.id || product.status !== "published") return { ok: false, skipped: true, reason: "product_not_published", matched: 0, emailed: 0 };
+  const solutionSync = await upsertSolutionFromProduct(product);
+  if (!solutionSync.ok || !solutionSync.solution) return { ok: false, error: solutionSync.error || "solution_sync_failed", matched: 0, emailed: 0 };
+  const needsResult = await supabaseSelect("needs", {
+    select: "id,user_id,session_id,title,raw_text,status,created_at,updated_at,contact_email,email,wants_contact,contact_permission,detected_category,detected_objective,recommended_services,metadata",
+    limit: String(Math.min(Number(limit || 80), 200)),
+    order: "created_at.desc"
+  });
+  const needs = needsResult.ok && Array.isArray(needsResult.data) ? needsResult.data : [];
+  const alerts = [];
+  const now = new Date().toISOString();
+  for (const need of needs) {
+    if (["REJECTED_UNSAFE", "REJECTED_ILLEGAL", "RESOLVED"].includes(String(need.status || ""))) continue;
+    const email = cleanString(need.contact_email || need.email).toLowerCase();
+    const canEmail = Boolean(email && need.wants_contact && need.contact_permission !== "none");
+    if (!canEmail) continue;
+    const analysisLookup = await supabaseSelect("need_analysis", { select: "*", need_id: `eq.${need.id}`, order: "created_at.desc", limit: "1" });
+    const analysis = analysisLookup.ok && Array.isArray(analysisLookup.data) && analysisLookup.data[0]
+      ? analysisLookup.data[0]
+      : fallbackNeedAnalysis(need);
+    const score = scoreSolutionMatch(solutionSync.solution, analysis, need);
+    if (score < 0.36) continue;
+    const existing = await supabaseSelect("need_solution_matches", {
+      select: "id,status",
+      need_id: `eq.${need.id}`,
+      solution_id: `eq.${solutionSync.solution.id}`,
+      limit: "1"
+    });
+    const alreadyMatched = existing.ok && Array.isArray(existing.data) && existing.data.length > 0;
+    const matchPayload = {
+      need_id: need.id,
+      solution_id: solutionSync.solution.id,
+      product_id: product.id,
+      match_type: "product_publish_alert",
+      rank: 1,
+      score: Number(score.toFixed(3)),
+      status: "suggested",
+      rationale: `Produit publie compatible avec les signaux de la demande (${analysis.category || need.detected_category || "categorie a qualifier"}).`,
+      match_reason: `${product.title} correspond a une demande conservee (${analysis.category || need.detected_category || "besoin a qualifier"}).`,
+      user_facing_copy: `Cette solution peut maintenant aider sur : ${analysis.primary_problem || analysis.summary || need.title || "votre besoin"}.`,
+      confidence_band: score >= AI_MATCH_THRESHOLD_HIGH ? "high" : "medium",
+      updated_at: now
+    };
+    if (!dryRun && !alreadyMatched) await supabaseInsert("need_solution_matches", { ...matchPayload, created_at: now });
+    const emailPayload = buildProductAlertEmail({ need, product, match: matchPayload, analysis });
+    let sendResult = { skipped: true, reason: dryRun ? "dry_run" : "not_sent" };
+    if (!dryRun) {
+      sendResult = await sendViaGraph(emailPayload);
+      await addOutbox([{ id: randomUUID(), needId: need.id, productId: product.id, type: "product_match_alert", status: sendResult.ok ? "sent" : "prepared", sendResult, createdAt: now, ...emailPayload }]);
+      await supabaseInsert("scheduled_emails", {
+        type: "product_match_alert",
+        user_id: need.user_id || null,
+        product_id: product.id,
+        recipient_email: email,
+        subject: emailPayload.subject,
+        status: sendResult.ok ? "sent" : "failed",
+        scheduled_at: now,
+        sent_at: sendResult.ok ? now : null,
+        payload: { source: "product_publish_alert", needId: need.id, score, productSlug: product.slug, emailPreview: emailPayload.text }
+      });
+      if (need.user_id) {
+        await supabaseInsert("notifications", {
+          user_id: need.user_id,
+          type: "product_match",
+          title: "Une solution correspond a votre demande",
+          message: `${product.title} peut correspondre a un besoin que vous aviez decrit.`,
+          action_url: `/produit/?slug=${product.slug}`,
+          metadata: { need_id: need.id, product_id: product.id, score }
+        });
+      }
+      await supabaseUpdate("needs", {
+        status: "MATCHED",
+        is_unmet: false,
+        user_response_status: sendResult.ok ? "sent" : "prepared",
+        user_response_sent_at: sendResult.ok ? now : null,
+        updated_at: now
+      }, { id: `eq.${need.id}` }, { returnRepresentation: false });
+      await recordNeedEvent(need.id, need.user_id, "product_match_alert", {
+        to_status: "MATCHED",
+        note: `Produit propose automatiquement : ${product.title}.`,
+        metadata: { product_id: product.id, product_slug: product.slug, score, emailSent: Boolean(sendResult.ok) }
+      });
+    }
+    alerts.push({ needId: need.id, email, score, alreadyMatched, emailSent: Boolean(sendResult.ok), sendResult });
+  }
+  return { ok: true, product: { id: product.id, slug: product.slug, title: product.title }, solution: { id: solutionSync.solution.id, slug: solutionSync.solution.slug }, matched: alerts.length, emailed: alerts.filter((row) => row.emailSent).length, alerts };
+}
+
 async function recordNeedEvent(needId, userId, eventType, details = {}) {
   if (!needId) return null;
   return supabaseInsert("need_events", {
@@ -4176,6 +4345,27 @@ async function handleAdminProductSync(req, res) {
   }
 }
 
+async function handleAdminProductResolveAlerts(req, res) {
+  const admin = await requireSupabaseSuperAdmin(req, res);
+  if (!admin) return;
+  try {
+    const fields = await readRequestBody(req);
+    const product = await supabaseProductBySlugOrId({
+      productId: cleanString(fields.product_id || fields.productId),
+      slug: cleanString(fields.slug)
+    });
+    if (!product) return jsonResponse(res, 404, { ok: false, error: "Produit introuvable." });
+    if (product.status !== "published") return jsonResponse(res, 409, { ok: false, error: "Le produit doit etre publie avant d'alerter les demandes." });
+    const result = await notifyMatchingNeedsForProduct(product, {
+      dryRun: Boolean(fields.dry_run),
+      limit: Number(fields.limit || 80)
+    });
+    return jsonResponse(res, result.ok ? 200 : 500, result);
+  } catch (error) {
+    jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
 async function handleLibrarySignedDownload(req, res, url) {
   const user = await supabaseAuthUser(req);
   if (!user?.id) return jsonResponse(res, 401, { ok: false, error: "Connexion requise." });
@@ -4727,6 +4917,7 @@ createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/api/checkout/analyse-express/session") return handleAnalyseExpressEmbeddedCheckout(req, res);
   if (req.method === "POST" && url.pathname === "/api/stripe/webhook") return handleStripeWebhook(req, res);
   if (req.method === "POST" && url.pathname === "/api/admin/products/sync-stripe") return handleAdminProductSync(req, res);
+  if (req.method === "POST" && url.pathname === "/api/admin/products/resolve-alerts") return handleAdminProductResolveAlerts(req, res);
   if (req.method === "POST" && url.pathname.startsWith("/api/admin/needs/") && url.pathname.endsWith("/analyze")) {
     return handleAdminAnalyzeNeed(req, res, url.pathname.replace("/api/admin/needs/", "").replace("/analyze", ""));
   }
