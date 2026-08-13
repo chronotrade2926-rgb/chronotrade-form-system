@@ -35,6 +35,13 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
 const STRIPE_ANALYSE_EXPRESS_PRICE_ID = process.env.STRIPE_ANALYSE_EXPRESS_PRICE_ID || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+const SUPER_ADMIN_EMAILS = new Set(
+  (process.env.CHRONOTRADE_SUPER_ADMIN_EMAILS ||
+    "bouchonnetflorent@gmail.com,bouchonneflorent@gmail.com,bouchonnflorent@gmail.com,chronotrade2926@gmail.com")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean)
+);
 const DEFAULT_GOOGLE_BUSINESS_REVIEW_URL = "https://g.page/r/Ca68lNm5PPKMEBI/review";
 const DEFAULT_GOOGLE_BUSINESS_PROFILE_URL = "https://www.google.com/search?q=ChronoTrade&stick=H4sIAAAAAAAA_-NgU1I1qDAxMDMzM002Mk00Skw2SrW0MqiwSE4zMk5OskyxtDRJSk5MXcTK7ZxRlJ-XH1KUmJIKAEWe0Vw3AAAA&hl=en-GB&mat=CTspJ23EUm1vElcBa0lj_9drynJWHP_mInqOnE3FOgciqrOI6NsRrc3ucF-NBEohPBpBLGqcJlkTjF8ipfyCty-pMVgqLsuXWbCJDnNJr2HF_ufTz3iVOEM9NnnmWnzK9sA&authuser=1&ved=2ahUKEwipp_6nj4-WAxU_TqQEHdF_FBQQ-MgIegQIDxAh";
 const GOOGLE_BUSINESS_REVIEW_URL = normalizeGoogleReviewUrl(process.env.GOOGLE_BUSINESS_REVIEW_URL || DEFAULT_GOOGLE_BUSINESS_REVIEW_URL);
@@ -1763,13 +1770,18 @@ function productToResolveSolution(product) {
   const metadata = product?.metadata && typeof product.metadata === "object" ? product.metadata : {};
   return {
     id: product.id,
-    type: product.product_type === "app" ? "APP" : product.product_type === "automation" ? "AUTOMATION" : product.product_type === "service" ? "SERVICE" : product.product_type === "resource" ? "RESOURCE" : "PRODUCT",
+    type: product.product_type === "app" ? "APP"
+      : product.product_type === "automation" ? "AUTOMATION"
+      : ["service", "sur_mesure", "personalise", "audit", "motion"].includes(product.product_type) ? "SERVICE"
+      : product.product_type === "resource" ? "RESOURCE"
+      : "PRODUCT",
     name: product.title,
     slug: product.slug,
     description: [product.short_description, product.description].filter(Boolean).join(" "),
     problems_solved: [
       ...(Array.isArray(metadata.intents) ? metadata.intents : []),
       ...(Array.isArray(metadata.catalogue_filters) ? metadata.catalogue_filters : []),
+      ...(Array.isArray(metadata.solution_tags) ? metadata.solution_tags : []),
       ...(Array.isArray(product.tags) ? product.tags : [])
     ],
     target_users: Array.isArray(metadata.target_users) ? metadata.target_users : [],
@@ -2152,12 +2164,15 @@ async function requireSupabaseSuperAdmin(req, res) {
   const role = await supabaseSelect("users", { select: "id,email,role", id: `eq.${user.id}`, limit: "1" });
   const profile = role.ok && Array.isArray(role.data) ? role.data[0] : null;
   const email = String(profile?.email || user.email || "").trim().toLowerCase();
-  const allowed = email === "bouchonnetflorent@gmail.com" || email === "chronotrade2926@gmail.com";
-  if (profile?.role !== "super_admin" || !allowed) {
+  const allowed = SUPER_ADMIN_EMAILS.has(email);
+  const ownerProfile = allowed && !profile
+    ? { id: user.id, email, role: "super_admin", inferred_owner: true }
+    : profile;
+  if (!allowed) {
     jsonResponse(res, 403, { ok: false, error: "Acces super-admin proprietaire requis." });
     return null;
   }
-  return { user, profile };
+  return { user, profile: ownerProfile };
 }
 
 async function requireSupabaseUser(req, res) {
