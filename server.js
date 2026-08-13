@@ -1621,12 +1621,22 @@ function fallbackNeedAnalysis(need, risk = null) {
   if (text.includes("logo") || text.includes("marque") || text.includes("branding")) add("branding");
   if (text.includes("application") || text.includes("app")) add("application");
   if (text.includes("partenaire") || text.includes("prestataire")) add("partenaire");
+  if (text.includes("client") || text.includes("clients") || text.includes("vente") || text.includes("vendre") || text.includes("prospect") || text.includes("activite") || text.includes("priorite") || text.includes("ameliorer") || text.includes("pourquoi")) {
+    add("audit");
+    add("diagnostic");
+    add("priorites");
+    add("clients");
+  }
   const category = tags.includes("avis Google") ? "Reputation / fidelisation"
     : tags.includes("automatisation") ? "Automatisation / productivite"
     : tags.includes("site web") ? "Site / presence digitale"
     : tags.includes("branding") ? "Image / branding"
+    : tags.includes("audit") ? "Diagnostic / priorites business"
     : tags.includes("partenaire") ? "Partenaires / business"
     : "Besoin a qualifier";
+  const facingSuggestion = tags.includes("audit")
+    ? "Premiere action utile : clarifier ce qui bloque vraiment avant de depenser plus. Analysez l'offre, la cible, la preuve de confiance, le canal d'acquisition et la priorite commerciale. ChronoTrade peut vous orienter vers une Analyse Express pour recevoir un plan clair et priorise."
+    : "Votre besoin a ete compris dans ses grandes lignes. ChronoTrade va chercher la solution la plus adaptee.";
   return {
     summary: risk ? "Demande necessitant une revue avant traitement." : (need.title || "Besoin ChronoTrade a qualifier"),
     primary_problem: need.title || need.raw_text.slice(0, 140),
@@ -1652,7 +1662,28 @@ function fallbackNeedAnalysis(need, risk = null) {
     suggested_questions: tags.length ? [] : ["Quel resultat concret voulez-vous obtenir en priorite ?"],
     user_facing_suggestion: risk
       ? "Votre demande a ete recue et sera verifiee manuellement avant toute reponse."
-      : "Votre besoin a ete compris dans ses grandes lignes. ChronoTrade va chercher la solution la plus adaptee."
+      : facingSuggestion
+  };
+}
+
+function boostAnalysisWithBusinessSignals(analysis, need) {
+  const text = normalizeForScoring([need.raw_text, need.title, analysis.summary, analysis.primary_problem, analysis.desired_outcome].join(" "));
+  const clientIssue = ["client", "clients", "prospect", "vente", "vendre", "acquisition", "visibilite", "conversion", "activite"].some((word) => text.includes(word));
+  const priorityIssue = ["priorite", "priorites", "quoi ameliorer", "par ou commencer", "bloque", "blocage", "pourquoi", "diagnostic", "audit"].some((word) => text.includes(word));
+  if (!clientIssue && !priorityIssue) return analysis;
+  const tags = arrayOfCleanStrings(analysis.solution_tags, 16);
+  for (const tag of ["audit", "analyse", "diagnostic", "priorites", "clients", "conversion", "plan clair"]) {
+    if (!tags.includes(tag)) tags.push(tag);
+  }
+  return {
+    ...analysis,
+    category: analysis.category && analysis.category !== "Besoin a qualifier" ? analysis.category : "Diagnostic / priorites business",
+    subcategory: analysis.subcategory || "analyse-express",
+    solution_tags: tags,
+    commercial_intent: analysis.commercial_intent === "low" ? "medium" : (analysis.commercial_intent || "medium"),
+    confidence_score: Math.max(Number(analysis.confidence_score || 0), 0.68),
+    needs_clarification: false,
+    user_facing_suggestion: analysis.user_facing_suggestion || "Commencez par isoler le vrai blocage : offre, cible, visibilite, confiance, tunnel ou relance. La prochaine action la plus logique est un diagnostic court avec priorites claires, puis seulement ensuite une action commerciale ou technique."
   };
 }
 
@@ -1682,6 +1713,10 @@ function scoreSolutionMatch(solution, analysis, need) {
   const rawWords = normalizeForScoring(need.raw_text).split(/\s+/).filter((word) => word.length > 4);
   const hits = rawWords.filter((word) => haystack.includes(word)).slice(0, 8).length;
   score += Math.min(0.24, hits * 0.03);
+  const slug = normalizeForScoring(solution.slug || solution.name || "");
+  const rawText = normalizeForScoring(need.raw_text || "");
+  const wantsDiagnostic = ["client", "clients", "prospect", "vente", "priorite", "priorites", "ameliorer", "activite", "blocage", "pourquoi"].some((word) => rawText.includes(word));
+  if (wantsDiagnostic && (slug.includes("analyse-express") || haystack.includes("analyse express") || haystack.includes("audit"))) score += 0.42;
   if (solution.public && solution.active) score += 0.08;
   return clampScore(score, 0);
 }
@@ -1779,6 +1814,7 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     aiStatus = error.name === "AbortError" ? "timeout" : "failed";
     errorMessage = error.message;
   }
+  analysis = boostAnalysisWithBusinessSignals(analysis || fallbackNeedAnalysis(need, null), need);
   analysis.confidence_score = clampScore(analysis.confidence_score, 0);
   analysis.repeatability_score = clampScore(analysis.repeatability_score, 0);
   analysis.secondary_problems = arrayOfCleanStrings(analysis.secondary_problems, 8);
@@ -2837,15 +2873,15 @@ async function handleResolveNeed(req, res) {
         ? Math.max(0, similar.data.filter((row) => row.id !== need?.id).length)
         : 0;
     }
-    const clientEmail = await sendResolveClientConfirmation({ ...payload, id: need?.id }, ai);
+    const clientEmail = { enabled: false, skipped: true, reason: "resolve_need_dashboard_only" };
     if (need?.id) {
       await supabaseUpdate("needs", {
-        user_response_status: clientEmail.enabled ? (clientEmail.ok ? "sent" : "failed") : "not_applicable",
-        user_response_sent_at: clientEmail.enabled && clientEmail.ok ? new Date().toISOString() : null,
+        user_response_status: "not_applicable",
+        user_response_sent_at: null,
         updated_at: new Date().toISOString()
       }, { id: `eq.${need.id}` }, { returnRepresentation: false });
     }
-    const notification = await sendResolveInternalNotification({ ...payload, id: need?.id });
+    const notification = { enabled: false, skipped: true, reason: "resolve_need_saved_dashboard_only" };
     return jsonResponse(res, 201, {
       ok: true,
       need: { id: need?.id || null, status: ai?.status || payload.status, ref: need?.id ? `REQ-${String(need.id).slice(0, 8).toUpperCase()}` : null },
