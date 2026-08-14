@@ -3369,6 +3369,13 @@ async function handleSiteEvent(req, res) {
       "solution_accepted",
       "solution_rejected",
       "problem_resolved",
+      "page_view",
+      "product_viewed",
+      "account_created",
+      "free_product_claimed",
+      "checkout_started",
+      "purchase_completed",
+      "review_submitted",
       "no_solution_found",
       "need_rejected",
       "solution_impression",
@@ -3400,6 +3407,44 @@ async function handleSiteEvent(req, res) {
   } catch (error) {
     return jsonResponse(res, 500, { ok: false, error: error.message });
   }
+}
+
+async function grantFreeProductAccess(product, authUser) {
+  const privateFile = await activeProductFile(product.id);
+  const accessUrl = productAccessUrl(product);
+  const entitlement = await supabaseUpsert("entitlements", {
+    user_id: authUser.id,
+    product_id: product.id,
+    order_id: null,
+    resource_type: product.slug || product.product_type || "product",
+    status: "active",
+    access_url: accessUrl,
+    version: product.current_version || privateFile?.version || "1.0",
+    metadata: {
+      label: product.title,
+      source: "free_product_claim",
+      productId: product.id,
+      productSlug: product.slug,
+      deliveryType: product.delivery_type || null,
+      privateFile: privateFile ? {
+        bucket: privateFile.storage_bucket,
+        path: privateFile.storage_path,
+        fileName: privateFile.file_name,
+        version: privateFile.version
+      } : null
+    },
+    updated_at: new Date().toISOString()
+  }, "user_id,resource_type,access_url");
+  await recordSiteEvent({
+    userId: authUser.id,
+    sessionId: null,
+    eventType: "free_product_claimed",
+    entityType: "product",
+    entityId: product.id,
+    path: `/produit/?slug=${product.slug}`,
+    metadata: { productSlug: product.slug, productTitle: product.title, entitlementOk: Boolean(entitlement.ok) }
+  });
+  return { entitlement, privateFile, accessUrl };
 }
 
 async function handleAdminAnalyzeNeed(req, res, needId) {
@@ -3610,11 +3655,16 @@ async function handleDynamicCheckoutSession(req, res, url) {
     const result = await dynamicCheckoutBody(fields, { user: authUser, hosted: fields.checkout_mode === "redirect" });
     if (result.error) return jsonResponse(res, result.errorStatus || 500, { ok: false, error: result.error });
     if (result.free) {
+      const grant = await grantFreeProductAccess(result.product, authUser);
+      if (!grant.entitlement.ok) {
+        return jsonResponse(res, 500, { ok: false, error: grant.entitlement.message || "Acces gratuit impossible a enregistrer." });
+      }
       return jsonResponse(res, 200, {
         ok: true,
         free: true,
         product: { id: result.product.id, slug: result.product.slug, title: result.product.title },
-        accessUrl: result.accessUrl
+        accessUrl: grant.accessUrl,
+        hasPrivateFile: Boolean(grant.privateFile)
       });
     }
     return jsonResponse(res, 200, {
