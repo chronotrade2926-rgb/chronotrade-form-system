@@ -37,7 +37,7 @@ const STRIPE_ANALYSE_EXPRESS_PRICE_ID = process.env.STRIPE_ANALYSE_EXPRESS_PRICE
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const SUPER_ADMIN_EMAILS = new Set(
   (process.env.CHRONOTRADE_SUPER_ADMIN_EMAILS ||
-    "bouchonnetflorent@gmail.com,bouchonneflorent@gmail.com,bouchonnflorent@gmail.com,chronotrade2926@gmail.com")
+    "bouchonneflorent@gmail.com")
     .split(",")
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean)
