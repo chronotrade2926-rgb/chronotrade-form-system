@@ -35,9 +35,18 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
 const STRIPE_ANALYSE_EXPRESS_PRICE_ID = process.env.STRIPE_ANALYSE_EXPRESS_PRICE_ID || "";
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+const CREDIT_MIN_PURCHASE_EUR = Number(process.env.CHRONOTRADE_CREDIT_MIN_PURCHASE_EUR || 10);
+const CREDITS_PER_EUR = Number(process.env.CHRONOTRADE_CREDITS_PER_EUR || 10);
+const FREE_MONTHLY_CREDITS = Number(process.env.CHRONOTRADE_FREE_MONTHLY_CREDITS || 100);
+const WELCOME_CREDITS = Number(process.env.CHRONOTRADE_WELCOME_CREDITS || 100);
+const DEFAULT_BILLING_PLANS = [
+  { code: "essentiel", name: "Essentiel", price_cents: 2000, currency: "EUR", monthly_credits: 250, deep_dives: 5, features: ["Socle gratuit conserve", "Conversations sauvegardees", "Alertes", "Profil d'interaction"] },
+  { code: "pro", name: "Pro", price_cents: 5000, currency: "EUR", monthly_credits: 700, deep_dives: 12, features: ["Tout Essentiel", "Limites d'analyse superieures", "Personnalisation avancee", "Memoire plus longue selon disponibilite"] },
+  { code: "max", name: "Max", price_cents: 10000, currency: "EUR", monthly_credits: 1600, deep_dives: 30, features: ["Tout Pro", "Limites superieures", "Budgets d'analyse plus eleves", "Personnalisation maximale disponible"] }
+];
 const SUPER_ADMIN_EMAILS = new Set(
   (process.env.CHRONOTRADE_SUPER_ADMIN_EMAILS ||
-    "bouchonneflorent@gmail.com")
+    "bouchonnetflorent@gmail.com")
     .split(",")
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean)
@@ -1622,6 +1631,7 @@ function fallbackNeedAnalysis(need, risk = null) {
   const text = normalizeForScoring(need.raw_text);
   const tags = [];
   const add = (tag) => { if (!tags.includes(tag)) tags.push(tag); };
+  const needsPromptHelp = text.includes("sais pas quoi ecrire") || text.includes("ne sais pas quoi ecrire") || text.includes("quoi ecrire") || text.includes("je dois mettre quoi") || text.includes("comment demander");
   if (text.includes("avis") || text.includes("google")) add("avis Google");
   if (text.includes("automatis") || text.includes("temps") || text.includes("repet")) add("automatisation");
   if (text.includes("site") || text.includes("landing")) add("site web");
@@ -1634,19 +1644,23 @@ function fallbackNeedAnalysis(need, risk = null) {
     add("priorites");
     add("clients");
   }
-  const category = tags.includes("avis Google") ? "Reputation / fidelisation"
+  if (needsPromptHelp) add("orientation");
+  const category = needsPromptHelp ? "Orientation / clarification"
+    : tags.includes("avis Google") ? "Reputation / fidelisation"
     : tags.includes("automatisation") ? "Automatisation / productivite"
     : tags.includes("site web") ? "Site / presence digitale"
     : tags.includes("branding") ? "Image / branding"
     : tags.includes("audit") ? "Diagnostic / priorites business"
     : tags.includes("partenaire") ? "Partenaires / business"
     : "Besoin a qualifier";
-  const facingSuggestion = tags.includes("audit")
+  const facingSuggestion = needsPromptHelp
+    ? "Pas besoin de formuler une demande parfaite. Commencez simplement par ce qui vous bloque, ce qui revient souvent, ce que vous aimeriez ameliorer ou ce que vous voulez eviter. ChronoTrade peut partir d'une phrase tres simple."
+    : tags.includes("audit")
     ? "Premiere action utile : clarifier ce qui bloque vraiment avant de depenser plus. Analysez l'offre, la cible, la preuve de confiance, le canal d'acquisition et la priorite commerciale. ChronoTrade peut vous orienter vers une Analyse Express pour recevoir un plan clair et priorise."
     : "Votre besoin a ete compris dans ses grandes lignes. ChronoTrade va chercher la solution la plus adaptee.";
   return {
-    summary: risk ? "Demande necessitant une revue avant traitement." : (need.title || "Besoin ChronoTrade a qualifier"),
-    primary_problem: need.title || need.raw_text.slice(0, 140),
+    summary: risk ? "Demande necessitant une revue avant traitement." : needsPromptHelp ? "Vous voulez etre guide pour formuler votre besoin." : (need.title || "Besoin ChronoTrade a qualifier"),
+    primary_problem: needsPromptHelp ? "Le point de depart n'est pas encore clair, mais vous pouvez commencer simplement." : (need.title || need.raw_text.slice(0, 140)),
     secondary_problems: [],
     desired_outcome: need.objective || need.priority || "Trouver une solution adaptee",
     user_type: need.user_type || "unknown",
@@ -1660,13 +1674,13 @@ function fallbackNeedAnalysis(need, risk = null) {
     commercial_intent: "unknown",
     repeatability_score: tags.length ? 0.55 : 0.25,
     estimated_complexity: "unknown",
-    confidence_score: risk ? 0.2 : (tags.length ? 0.62 : 0.35),
-    needs_clarification: tags.length === 0,
-    needs_human_review: Boolean(risk) || tags.length === 0,
+    confidence_score: risk ? 0.2 : needsPromptHelp ? 0.7 : (tags.length ? 0.62 : 0.35),
+    needs_clarification: needsPromptHelp ? true : tags.length === 0,
+    needs_human_review: Boolean(risk) || (!needsPromptHelp && tags.length === 0),
     safe_to_process: !risk,
     moderation_reason: risk?.reason || "",
     rejection_reason_if_any: risk?.reason || "",
-    suggested_questions: tags.length ? [] : ["Quel resultat concret voulez-vous obtenir en priorite ?"],
+    suggested_questions: needsPromptHelp ? ["Qu'est-ce qui vous bloque ou revient souvent en ce moment, meme si c'est vague ?"] : tags.length ? [] : ["Quel resultat concret voulez-vous obtenir en priorite ?"],
     user_facing_suggestion: risk
       ? "Votre demande a ete recue et sera verifiee manuellement avant toute reponse."
       : facingSuggestion
@@ -1953,6 +1967,49 @@ async function recordNeedEvent(needId, userId, eventType, details = {}) {
   });
 }
 
+function estimatedUsageCredits(usageSummary = {}) {
+  const cost = Number(usageSummary.estimated_cost_usd || 0);
+  if (!Number.isFinite(cost) || cost <= 0) return 0;
+  const eurEstimate = cost * 1.1;
+  return Math.max(1, Math.ceil(eurEstimate * CREDITS_PER_EUR));
+}
+
+async function recordUsageEvent({
+  userId = null,
+  needId = null,
+  sessionId = "",
+  operation,
+  provider = "openai",
+  model = "",
+  usageSummary = {},
+  status = "recorded",
+  chargedCredits = 0,
+  metadata = {}
+} = {}) {
+  if (!operation) return { skipped: true, reason: "missing_operation" };
+  return supabaseInsert("usage_events", {
+    user_id: userId || null,
+    need_id: needId || null,
+    session_id: cleanString(sessionId) || null,
+    operation,
+    provider: cleanString(provider) || null,
+    model: cleanString(model) || null,
+    input_tokens: Number(usageSummary.input_tokens || 0),
+    output_tokens: Number(usageSummary.output_tokens || 0),
+    total_tokens: Number(usageSummary.total_tokens || 0),
+    estimated_cost_usd: usageSummary.estimated_cost_usd == null ? null : Number(usageSummary.estimated_cost_usd),
+    charged_credits: Number(chargedCredits || 0),
+    status,
+    metadata: {
+      ...metadata,
+      estimated_credits: estimatedUsageCredits(usageSummary),
+      duration_ms: usageSummary.duration_ms || null,
+      raw_usage: usageSummary.raw || {}
+    },
+    updated_at: new Date().toISOString()
+  });
+}
+
 async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
   if (!need?.id) return { skipped: true, reason: "missing_need" };
   const prompt = await activeNeedPrompt();
@@ -2069,6 +2126,26 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     entityType: "need",
     entityId: need.id,
     metadata: { confidence: analysis.confidence_score, matches: matches.length, status: nextStatus, runStatus: aiStatus }
+  });
+  await recordUsageEvent({
+    userId: need.user_id || null,
+    needId: need.id,
+    sessionId: need.session_id || null,
+    operation: "need_analysis",
+    provider: "openai",
+    model: modelUsed,
+    usageSummary,
+    status: aiStatus === "failed" || aiStatus === "timeout" ? "failed" : "recorded",
+    chargedCredits: 0,
+    metadata: {
+      run_id: runId || null,
+      run_status: aiStatus,
+      source: OPENAI_API_KEY && modelResult?.payload ? "model" : "fallback",
+      next_status: nextStatus,
+      confidence: analysis.confidence_score,
+      matches: matches.length,
+      note: "Trace d'usage uniquement. Aucun debit credit sans reservation UsageGate."
+    }
   });
   if (matches.length) await recordNeedEvent(need.id, need.user_id, "ai_match_generated", { metadata: { bestScore, matches: matches.map((match) => ({ solution_id: match.solution_id, score: match.score })) } });
   if (matches.length) {
@@ -2218,6 +2295,354 @@ function unixToIso(value) {
 
 function subscriptionAccessStatus(status) {
   return ["active", "trialing"].includes(String(status || "").toLowerCase()) ? "active" : "expired";
+}
+
+function configuredBillingPlans() {
+  let plans = DEFAULT_BILLING_PLANS;
+  if (process.env.CHRONOTRADE_BILLING_PLANS_JSON) {
+    try {
+      const parsed = JSON.parse(process.env.CHRONOTRADE_BILLING_PLANS_JSON);
+      if (Array.isArray(parsed) && parsed.length) plans = parsed;
+    } catch {}
+  }
+  return plans.map((plan) => {
+    const code = cleanString(plan.code).toLowerCase();
+    const envKey = code.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
+    return {
+      code,
+      name: cleanString(plan.name) || code,
+      price_cents: Number(plan.price_cents || plan.priceCents || 0),
+      currency: cleanString(plan.currency || "EUR").toUpperCase(),
+      monthly_credits: Number(plan.monthly_credits || plan.monthlyCredits || 0),
+      deep_dives: Number(plan.deep_dives || plan.deepDives || 0),
+      stripe_price_id: cleanString(plan.stripe_price_id || plan.stripePriceId || process.env[`STRIPE_${envKey}_PRICE_ID`]),
+      status: cleanString(plan.status || "active"),
+      visible: plan.visible !== false,
+      features: Array.isArray(plan.features) ? plan.features.map(cleanString).filter(Boolean) : []
+    };
+  }).filter((plan) => plan.code && plan.price_cents > 0);
+}
+
+function billingPlanByCode(code) {
+  const cleanCode = cleanString(code).toLowerCase();
+  return configuredBillingPlans().find((plan) => plan.code === cleanCode && plan.status !== "archived") || null;
+}
+
+function normalizeBillingPlan(row = {}) {
+  const metadata = row.metadata || {};
+  const code = cleanString(row.slug || row.code).toLowerCase();
+  if (!code) return null;
+  return {
+    code,
+    id: row.id || null,
+    product_id: row.product_id || null,
+    name: cleanString(row.name) || code,
+    price_cents: Number(row.price_cents || row.priceCents || 0),
+    currency: cleanString(row.currency || "EUR").toUpperCase(),
+    monthly_credits: Number(metadata.monthly_credits || row.monthly_credits || 0),
+    deep_dives: Number(metadata.deep_dives || row.deep_dives || 0),
+    stripe_price_id: cleanString(row.stripe_price_id || metadata.stripe_price_id),
+    status: cleanString(row.status || "active"),
+    visible: metadata.visible !== false,
+    features: Array.isArray(metadata.features) ? metadata.features.map(cleanString).filter(Boolean) : []
+  };
+}
+
+async function configuredBillingPlansLive() {
+  const defaults = configuredBillingPlans();
+  const result = await supabaseSelect("product_plans", {
+    select: "id,product_id,name,slug,pricing_model,price_cents,currency,interval,stripe_price_id,status,metadata",
+    slug: "in.(essentiel,pro,max)",
+    order: "sort_order.asc,created_at.asc"
+  });
+  if (!result.ok || !Array.isArray(result.data) || !result.data.length) return defaults;
+  const live = result.data.map(normalizeBillingPlan).filter((plan) => plan && plan.status !== "archived" && plan.price_cents > 0);
+  const merged = new Map(defaults.map((plan) => [plan.code, plan]));
+  live.forEach((plan) => merged.set(plan.code, { ...(merged.get(plan.code) || {}), ...plan }));
+  return [...merged.values()];
+}
+
+async function billingPlanByCodeLive(code) {
+  const cleanCode = cleanString(code).toLowerCase();
+  const plans = await configuredBillingPlansLive();
+  return plans.find((plan) => plan.code === cleanCode && plan.status !== "archived") || null;
+}
+
+function creditsForEuroAmount(amountEur) {
+  return Math.max(0, Math.round(Number(amountEur || 0) * CREDITS_PER_EUR));
+}
+
+function ledgerAmount(row) {
+  return Number(row.amount_credits ?? row.credits ?? 0) || 0;
+}
+
+async function walletLedgerRows(userId, limit = 80) {
+  if (!userId) return { rows: [], error: null };
+  const result = await supabaseSelect("wallet_ledger", {
+    select: "*",
+    user_id: `eq.${userId}`,
+    order: "created_at.desc",
+    limit: String(limit)
+  });
+  return { rows: result.ok && Array.isArray(result.data) ? result.data : [], error: result.ok ? null : result.message };
+}
+
+async function walletBalance(userId) {
+  const { rows } = await walletLedgerRows(userId, 500);
+  return rows.reduce((total, row) => total + ledgerAmount(row), 0);
+}
+
+async function recordWalletLedgerEntry({
+  userId,
+  entryType,
+  amountCredits,
+  amountCents = null,
+  currency = "EUR",
+  externalReference,
+  stripeSessionId = "",
+  stripeInvoiceId = "",
+  metadata = {}
+}) {
+  if (!userId || !externalReference) return { skipped: true, reason: "missing_user_or_reference" };
+  const existing = await supabaseSelect("wallet_ledger", {
+    select: "id,amount_credits,external_reference",
+    external_reference: `eq.${externalReference}`,
+    limit: "1"
+  });
+  if (existing.ok && Array.isArray(existing.data) && existing.data.length) {
+    return { ok: true, duplicate: true, ledger: existing.data[0] };
+  }
+  const currentBalance = await walletBalance(userId);
+  const nextBalance = currentBalance + Number(amountCredits || 0);
+  const now = new Date().toISOString();
+  const ledger = await supabaseInsert("wallet_ledger", {
+    user_id: userId,
+    entry_type: entryType,
+    amount_credits: Number(amountCredits || 0),
+    balance_after: nextBalance,
+    amount_cents: amountCents,
+    currency: cleanString(currency || "EUR").toUpperCase(),
+    external_reference: externalReference,
+    stripe_session_id: stripeSessionId || null,
+    stripe_invoice_id: stripeInvoiceId || null,
+    status: "posted",
+    metadata,
+    created_at: now
+  });
+  if (ledger.ok) {
+    await supabaseUpsert("user_wallets", {
+      user_id: userId,
+      balance_credits: nextBalance,
+      currency: "CREDIT",
+      updated_at: now
+    }, "user_id");
+  }
+  return { ...ledger, balance: nextBalance };
+}
+
+async function ensureWelcomeCredits(userId) {
+  if (!userId || !WELCOME_CREDITS) return { skipped: true, reason: "missing_user_or_disabled" };
+  return recordWalletLedgerEntry({
+    userId,
+    entryType: "welcome_bonus",
+    amountCredits: WELCOME_CREDITS,
+    amountCents: 0,
+    currency: "CREDIT",
+    externalReference: `welcome:${userId}:v1`,
+    metadata: {
+      source: "account_bootstrap",
+      label: `Bonus de bienvenue ChronoTrade - ${WELCOME_CREDITS} credits`,
+      promotional: true,
+      idempotent: true
+    }
+  });
+}
+
+async function activeUserSubscription(userId) {
+  if (!userId) return null;
+  const result = await supabaseSelect("subscriptions", {
+    select: "*",
+    user_id: `eq.${userId}`,
+    status: "in.(active,trialing,past_due)",
+    order: "current_period_end.desc",
+    limit: "1"
+  });
+  return result.ok && Array.isArray(result.data) ? result.data[0] || null : null;
+}
+
+function subscriptionPlanFromMetadata(subscription) {
+  const code = cleanString(subscription?.metadata?.planCode || subscription?.metadata?.plan_code || subscription?.metadata?.planSlug).toLowerCase();
+  return billingPlanByCode(code);
+}
+
+function walletRecommendation({ ledgerRows = [], activePlan = null }) {
+  if (activePlan) return null;
+  const now = Date.now();
+  const last30 = ledgerRows.filter((row) => {
+    const created = row.created_at ? new Date(row.created_at).getTime() : 0;
+    return created && now - created <= 30 * 24 * 60 * 60 * 1000 && row.entry_type === "credit_purchase";
+  });
+  const spentCents = last30.reduce((total, row) => total + Number(row.amount_cents || 0), 0);
+  if (spentCents < 5000) return null;
+  const plan = configuredBillingPlans().find((item) => item.code === "pro") || configuredBillingPlans()[1] || configuredBillingPlans()[0];
+  if (!plan) return null;
+  return {
+    title: `${plan.name} pourrait devenir plus avantageux.`,
+    text: `Sur les 30 derniers jours, vos achats ponctuels representent ${formatMoneyCents(spentCents, "EUR")}. Comparez avec ${formatMoneyCents(plan.price_cents, plan.currency)} / mois avant de racheter des credits.`,
+    planCode: plan.code
+  };
+}
+
+async function usageRowsForPeriod(userId, { start, end, limit = 200 } = {}) {
+  if (!userId) return { rows: [], error: null };
+  const filters = {
+    select: "id,operation,provider,model,total_tokens,estimated_cost_usd,charged_credits,status,metadata,created_at",
+    user_id: `eq.${userId}`,
+    order: "created_at.desc",
+    limit: String(limit)
+  };
+  if (start) filters.created_at = `gte.${start}`;
+  const result = await supabaseSelect("usage_events", filters);
+  const rows = result.ok && Array.isArray(result.data) ? result.data : [];
+  const filtered = end ? rows.filter((row) => new Date(row.created_at).getTime() <= new Date(end).getTime()) : rows;
+  return { rows: filtered, error: result.ok ? null : result.message };
+}
+
+function usageCredits(row) {
+  const charged = Number(row?.charged_credits || 0);
+  if (Number.isFinite(charged) && charged > 0) return charged;
+  const estimated = Number(row?.metadata?.estimated_credits || 0);
+  return Number.isFinite(estimated) && estimated > 0 ? estimated : 0;
+}
+
+function usageSummaryForWallet(rows = [], plan = null) {
+  const usedCredits = rows.reduce((total, row) => total + usageCredits(row), 0);
+  const freeLimit = FREE_MONTHLY_CREDITS;
+  const subscriptionLimit = Number(plan?.monthly_credits || 0);
+  const freeUsed = Math.min(usedCredits, freeLimit);
+  const subscriptionUsed = Math.min(Math.max(usedCredits - freeLimit, 0), subscriptionLimit);
+  const walletUsed = Math.max(usedCredits - freeLimit - subscriptionLimit, 0);
+  return {
+    period_used_credits: usedCredits,
+    free_monthly_limit: freeLimit,
+    free_remaining: Math.max(freeLimit - freeUsed, 0),
+    subscription_monthly_limit: subscriptionLimit,
+    subscription_remaining: Math.max(subscriptionLimit - subscriptionUsed, 0),
+    wallet_estimated_used: walletUsed,
+    total_events: rows.length,
+    operations: rows.reduce((acc, row) => {
+      const key = row.operation || "unknown";
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {}),
+    recent: rows.slice(0, 8).map((row) => ({
+      id: row.id,
+      operation: row.operation,
+      provider: row.provider || null,
+      model: row.model || null,
+      estimated_credits: usageCredits(row),
+      charged_credits: Number(row.charged_credits || 0),
+      status: row.status || "recorded",
+      created_at: row.created_at
+    }))
+  };
+}
+
+async function reserveUsageCredits({ userId, operation, credits, externalReference, metadata = {} }) {
+  const amount = Math.max(0, Math.ceil(Number(credits || 0)));
+  if (!userId || !operation || !externalReference || amount < 1) {
+    return { ok: false, skipped: true, reason: "missing_usage_reservation_input" };
+  }
+  const existing = await supabaseSelect("usage_reservations", {
+    select: "id,status,reserved_credits,external_reference",
+    external_reference: `eq.${externalReference}`,
+    limit: "1"
+  });
+  if (existing.ok && Array.isArray(existing.data) && existing.data.length) {
+    return { ok: true, duplicate: true, reservation: existing.data[0] };
+  }
+  const balance = await walletBalance(userId);
+  if (balance < amount) {
+    return { ok: false, status: "insufficient_credits", balance_credits: balance, required_credits: amount };
+  }
+  const reservation = await supabaseInsert("usage_reservations", {
+    user_id: userId,
+    operation: cleanString(operation).slice(0, 80),
+    reserved_credits: amount,
+    status: "reserved",
+    external_reference: externalReference,
+    metadata: {
+      ...metadata,
+      source: "usage_gate",
+      balance_before: balance,
+      consumption_order: ["free_entitlement", "subscription_entitlement", "wallet_credits"]
+    }
+  });
+  if (!reservation.ok) return { ok: false, error: reservation.message };
+  return { ok: true, reservation: Array.isArray(reservation.data) ? reservation.data[0] : reservation.data, balance_credits: balance };
+}
+
+async function settleUsageReservation({ reservationId, userId, usageEventId = null, chargedCredits = null, metadata = {} }) {
+  if (!reservationId || !userId) return { ok: false, skipped: true, reason: "missing_settlement_input" };
+  const lookup = await supabaseSelect("usage_reservations", {
+    select: "*",
+    id: `eq.${reservationId}`,
+    user_id: `eq.${userId}`,
+    limit: "1"
+  });
+  const reservation = lookup.ok && Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!reservation?.id) return { ok: false, error: lookup.message || "Reservation introuvable." };
+  if (reservation.status === "settled") return { ok: true, duplicate: true, reservation };
+  if (reservation.status !== "reserved") return { ok: false, error: `Reservation non payable (${reservation.status}).` };
+  const amount = Math.max(0, Math.ceil(Number(chargedCredits ?? reservation.reserved_credits ?? 0)));
+  if (amount > 0) {
+    const ledger = await recordWalletLedgerEntry({
+      userId,
+      entryType: "usage_settle",
+      amountCredits: -amount,
+      currency: "CREDIT",
+      externalReference: `usage_settle:${reservation.id}`,
+      metadata: {
+        ...metadata,
+        reservationId: reservation.id,
+        operation: reservation.operation,
+        usageEventId,
+        source: "usage_gate"
+      }
+    });
+    if (!ledger.ok) return { ok: false, error: ledger.message || "Debit usage impossible." };
+  }
+  const updated = await supabaseUpdate("usage_reservations", {
+    status: "settled",
+    usage_event_id: usageEventId,
+    updated_at: new Date().toISOString(),
+    metadata: { ...(reservation.metadata || {}), ...metadata, charged_credits: amount }
+  }, { id: `eq.${reservation.id}` }, { returnRepresentation: false });
+  return { ok: updated.ok, reservation, charged_credits: amount, error: updated.ok ? null : updated.message };
+}
+
+async function releaseUsageReservation({ reservationId, userId, reason = "operation_failed", metadata = {} }) {
+  if (!reservationId || !userId) return { ok: false, skipped: true, reason: "missing_release_input" };
+  const lookup = await supabaseSelect("usage_reservations", {
+    select: "*",
+    id: `eq.${reservationId}`,
+    user_id: `eq.${userId}`,
+    limit: "1"
+  });
+  const reservation = lookup.ok && Array.isArray(lookup.data) ? lookup.data[0] : null;
+  if (!reservation?.id) return { ok: false, error: lookup.message || "Reservation introuvable." };
+  if (reservation.status === "released") return { ok: true, duplicate: true, reservation };
+  if (reservation.status !== "reserved") return { ok: false, error: `Reservation non liberable (${reservation.status}).` };
+  const updated = await supabaseUpdate("usage_reservations", {
+    status: "released",
+    updated_at: new Date().toISOString(),
+    metadata: { ...(reservation.metadata || {}), ...metadata, release_reason: reason }
+  }, { id: `eq.${reservation.id}` }, { returnRepresentation: false });
+  return { ok: updated.ok, reservation, error: updated.ok ? null : updated.message };
+}
+
+function formatMoneyCents(amountCents, currency = "EUR") {
+  return new Intl.NumberFormat("fr-FR", { style: "currency", currency }).format(Number(amountCents || 0) / 100);
 }
 
 function isPaidProduct(product) {
@@ -3201,6 +3626,15 @@ async function handleResolveClarification(req, res, needId) {
         confidence: ai?.analysis?.confidence_score ?? null
       },
       questions: ai?.analysis?.suggested_questions || [],
+      raw_text: enrichedNeed.raw_text,
+      reasoning_state: {
+        facts_explicit: [need.raw_text, answer].filter(Boolean),
+        interpretation_user: `${question} ${answer}`.trim(),
+        hypotheses: ai?.analysis?.solution_tags || [],
+        unknowns: ai?.analysis?.suggested_questions || [],
+        uncertainty_level: Number(ai?.analysis?.confidence_score || 0) >= 0.7 ? "low" : "medium",
+        updated_by: "clarification"
+      },
       matches: (ai?.matches || []).map((match) => ({
         solutionId: match.solution_id,
         score: match.score,
@@ -3828,6 +4262,10 @@ async function syncSubscriptionFromStripe(subscription, sourceEvent = "") {
       sourceEvent,
       productSlug: product?.slug || metadata.product_slug || null,
       planSlug: plan?.slug || metadata.plan_slug || null,
+      planCode: metadata.plan_code || metadata.planCode || plan?.slug || null,
+      planName: metadata.plan_name || metadata.planName || plan?.name || null,
+      monthlyCredits: Number(metadata.monthly_credits || plan?.metadata?.monthly_credits || 0),
+      deepDives: Number(metadata.deep_dives || plan?.metadata?.deep_dives || 0),
       priceId: price.id || null
     },
     updated_at: new Date().toISOString()
@@ -4219,6 +4657,72 @@ async function notifyOrder(order) {
   return results;
 }
 
+async function applyCreditPurchaseFromStripeSession(session, eventType = "") {
+  const metadata = session.metadata || {};
+  const userId = metadata.user_id || "";
+  if (!userId) return { skipped: true, reason: "missing_user_id" };
+  const paid = session.payment_status === "paid" || eventType === "checkout.session.async_payment_succeeded";
+  if (!paid) return { skipped: true, reason: `payment_${session.payment_status || "not_paid"}` };
+  const amountCents = Number(metadata.amount_cents || session.amount_total || 0);
+  const credits = Number(metadata.credits || creditsForEuroAmount(amountCents / 100));
+  if (!credits || credits < 1) return { skipped: true, reason: "missing_credits" };
+  const result = await recordWalletLedgerEntry({
+    userId,
+    entryType: "credit_purchase",
+    amountCredits: credits,
+    amountCents,
+    currency: String(session.currency || "EUR").toUpperCase(),
+    externalReference: `stripe_session:${session.id}:credits`,
+    stripeSessionId: session.id,
+    metadata: {
+      source: "stripe_checkout",
+      eventType,
+      label: `Achat de ${credits} credits`,
+      creditsPerEur: Number(metadata.credits_per_eur || CREDITS_PER_EUR),
+      stripeCustomerId: typeof session.customer === "string" ? session.customer : session.customer?.id || null
+    }
+  });
+  if (result.enabled !== false && result.ok === false) throw new Error(result.message || "Credit wallet non enregistre.");
+  return result;
+}
+
+async function grantSubscriptionCredits(subscription, eventType = "", invoice = null) {
+  if (!subscription?.id) return { skipped: true, reason: "missing_subscription" };
+  const metadata = subscription.metadata || {};
+  const userId = metadata.user_id || "";
+  if (!userId) return { skipped: true, reason: "missing_user_id" };
+  const status = String(subscription.status || "").toLowerCase();
+  if (!["active", "trialing"].includes(status)) return { skipped: true, reason: `subscription_${status || "inactive"}` };
+  const plan = subscriptionPlanFromMetadata(subscription);
+  const credits = Number(metadata.monthly_credits || plan?.monthly_credits || 0);
+  if (!credits) return { skipped: true, reason: "missing_monthly_credits" };
+  const periodStart = subscription.current_period_start || invoice?.period_start || invoice?.lines?.data?.[0]?.period?.start || "";
+  const invoiceId = invoice?.id || (typeof subscription.latest_invoice === "string" ? subscription.latest_invoice : subscription.latest_invoice?.id || "");
+  const reference = invoiceId
+    ? `stripe_invoice:${invoiceId}:subscription_credits`
+    : `subscription:${subscription.id}:${periodStart || "current"}:credits`;
+  const result = await recordWalletLedgerEntry({
+    userId,
+    entryType: "subscription_allowance",
+    amountCredits: credits,
+    amountCents: 0,
+    currency: "EUR",
+    externalReference: reference,
+    stripeInvoiceId: invoiceId,
+    metadata: {
+      source: "stripe_subscription",
+      eventType,
+      subscriptionId: subscription.id,
+      planCode: plan?.code || metadata.plan_code || null,
+      planName: plan?.name || metadata.plan_name || null,
+      periodStart: unixToIso(periodStart),
+      periodEnd: unixToIso(subscription.current_period_end)
+    }
+  });
+  if (result.enabled !== false && result.ok === false) throw new Error(result.message || "Allocation abonnement non enregistree.");
+  return result;
+}
+
 async function handleStripeWebhook(req, res) {
   let rawBody = null;
   let event = null;
@@ -4260,14 +4764,27 @@ async function handleStripeWebhook(req, res) {
     }
     if (event.type.startsWith("invoice.")) {
       const subscription = await handleStripeInvoiceEvent(event);
+      if (event.type === "invoice.payment_succeeded") {
+        const subscriptionId = typeof event.data.object?.subscription === "string" ? event.data.object.subscription : event.data.object?.subscription?.id;
+        const details = await fetchStripeSubscription(subscriptionId);
+        if (details) await grantSubscriptionCredits(details, event.type, event.data.object);
+      }
       await recordStripeEventFinish(event, "processed");
       return jsonResponse(res, 200, { ok: true, event: event.type, subscription });
     }
     const detailedSession = await fetchStripeSessionDetails(event.data.object || {});
+    if (detailedSession.metadata?.source === "chronotrade_credit_purchase") {
+      const credit = await applyCreditPurchaseFromStripeSession(detailedSession, event.type);
+      await recordStripeEventFinish(event, "processed");
+      return jsonResponse(res, 200, { ok: true, event: event.type, credit });
+    }
     if (detailedSession.mode === "subscription" && detailedSession.subscription) {
       const subscriptionId = typeof detailedSession.subscription === "string" ? detailedSession.subscription : detailedSession.subscription.id;
       const subscriptionDetails = await fetchStripeSubscription(subscriptionId);
-      if (subscriptionDetails) await syncSubscriptionFromStripe(subscriptionDetails, event.type);
+      if (subscriptionDetails) {
+        await syncSubscriptionFromStripe(subscriptionDetails, event.type);
+        if (detailedSession.payment_status === "paid") await grantSubscriptionCredits(subscriptionDetails, event.type, detailedSession.invoice || null);
+      }
     }
     const normalizedOrder = await orderFromStripeSession(detailedSession);
     if (event.type === "checkout.session.async_payment_succeeded") normalizedOrder.status = "paid";
@@ -4516,10 +5033,157 @@ async function handleBillingPortal(req, res) {
       method: "POST",
       body: stripeParams({
         customer,
-        return_url: `${SITE_ORIGIN}/dashboard/abonnements/`
+        return_url: `${SITE_ORIGIN}/dashboard/commandes/`
       })
     });
     return jsonResponse(res, 200, { ok: true, url: portal.url });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+async function handleWalletSummary(req, res) {
+  const user = await requireSupabaseUser(req, res);
+  if (!user) return;
+  try {
+    const welcome = await ensureWelcomeCredits(user.id);
+    const { rows, error } = await walletLedgerRows(user.id, 80);
+    const balance = rows.reduce((total, row) => total + ledgerAmount(row), 0);
+    const activeSubscription = await activeUserSubscription(user.id);
+    const plan = subscriptionPlanFromMetadata(activeSubscription);
+    const periodStart = activeSubscription?.current_period_start || new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString();
+    const periodEnd = activeSubscription?.current_period_end || null;
+    const usageRows = await usageRowsForPeriod(user.id, { start: periodStart, end: periodEnd, limit: 200 });
+    const usageDetails = usageSummaryForWallet(usageRows.rows, plan);
+    const plans = (await configuredBillingPlansLive()).filter((item) => item.visible !== false && item.status === "active");
+    const recommendation = walletRecommendation({ ledgerRows: rows, activePlan: activeSubscription });
+    return jsonResponse(res, 200, {
+      ok: true,
+      wallet: {
+        balance_credits: balance,
+        free_monthly_credits: FREE_MONTHLY_CREDITS,
+        welcome_credits: WELCOME_CREDITS,
+        credits_per_eur: CREDITS_PER_EUR,
+        min_purchase_eur: CREDIT_MIN_PURCHASE_EUR
+      },
+      usage: {
+        quota_remaining: usageDetails.free_remaining + usageDetails.subscription_remaining + balance,
+        next_reset_at: activeSubscription?.current_period_end || null,
+        period_start: periodStart,
+        period_end: periodEnd,
+        ...usageDetails,
+        storage: usageRows.error ? { ok: false, error: usageRows.error } : { ok: true }
+      },
+      subscription: activeSubscription ? {
+        id: activeSubscription.id,
+        status: activeSubscription.status,
+        plan_code: plan?.code || activeSubscription.metadata?.planCode || activeSubscription.metadata?.plan_code || null,
+        plan_name: plan?.name || activeSubscription.metadata?.planName || "Abonnement ChronoTrade",
+        current_period_end: activeSubscription.current_period_end,
+        cancel_at_period_end: Boolean(activeSubscription.cancel_at_period_end)
+      } : null,
+      plans,
+      recommendation,
+      ledger: rows.slice(0, 20).map((row) => ({
+        id: row.id,
+        entry_type: row.entry_type,
+        amount_credits: ledgerAmount(row),
+        balance_after: Number(row.balance_after || 0),
+        amount_cents: row.amount_cents,
+        currency: row.currency || "EUR",
+        status: row.status || "posted",
+        created_at: row.created_at,
+        label: row.metadata?.label || row.metadata?.planName || row.metadata?.source || row.entry_type
+      })),
+      bootstrap: welcome,
+      storage: error ? { ok: false, error } : { ok: true }
+    });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+async function handleCreditCheckoutSession(req, res) {
+  const user = await requireSupabaseUser(req, res);
+  if (!user) return;
+  if (!STRIPE_SECRET_KEY) return jsonResponse(res, 503, { ok: false, error: "STRIPE_SECRET_KEY absente dans Render." });
+  try {
+    const fields = await readRequestBody(req);
+    const requestedAmount = Number(fields.amount_eur || fields.amount || 0);
+    const amountEur = Math.max(CREDIT_MIN_PURCHASE_EUR, Math.round(requestedAmount * 100) / 100);
+    const amountCents = Math.round(amountEur * 100);
+    const credits = creditsForEuroAmount(amountEur);
+    const customer = await ensureStripeCustomerForUser(user);
+    const returnUrl = new URL("/dashboard/commandes/", SITE_ORIGIN);
+    returnUrl.searchParams.set("credits", "success");
+    returnUrl.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}");
+    const body = new URLSearchParams({
+      mode: "payment",
+      customer,
+      "line_items[0][quantity]": "1",
+      "line_items[0][price_data][currency]": "eur",
+      "line_items[0][price_data][unit_amount]": String(amountCents),
+      "line_items[0][price_data][product_data][name]": `Credits ChronoTrade - ${credits} credits`,
+      "line_items[0][price_data][product_data][description]": "Credits utilisables pour continuer vos analyses et approfondissements ChronoTrade.",
+      "metadata[source]": "chronotrade_credit_purchase",
+      "metadata[user_id]": user.id,
+      "metadata[amount_cents]": String(amountCents),
+      "metadata[credits]": String(credits),
+      "metadata[credits_per_eur]": String(CREDITS_PER_EUR),
+      success_url: returnUrl.toString(),
+      cancel_url: `${SITE_ORIGIN}/dashboard/commandes/?credits=cancel`
+    });
+    const { stripeResponse, session } = await createStripeCheckoutSession(body);
+    if (!stripeResponse.ok || !session.url) return jsonResponse(res, 502, { ok: false, error: session.error?.message || "Paiement credits indisponible." });
+    return jsonResponse(res, 200, { ok: true, url: session.url, id: session.id, amount_eur: amountEur, credits });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+async function handleSubscriptionCheckoutSession(req, res) {
+  const user = await requireSupabaseUser(req, res);
+  if (!user) return;
+  if (!STRIPE_SECRET_KEY) return jsonResponse(res, 503, { ok: false, error: "STRIPE_SECRET_KEY absente dans Render." });
+  try {
+    const fields = await readRequestBody(req);
+    const plan = await billingPlanByCodeLive(fields.plan_code || fields.planCode || fields.plan);
+    if (!plan || plan.status !== "active" || plan.visible === false) return jsonResponse(res, 404, { ok: false, error: "Formule ChronoTrade indisponible." });
+    const customer = await ensureStripeCustomerForUser(user);
+    const returnUrl = new URL("/dashboard/commandes/", SITE_ORIGIN);
+    returnUrl.searchParams.set("subscription", plan.code);
+    returnUrl.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}");
+    const body = new URLSearchParams({
+      mode: "subscription",
+      customer,
+      "line_items[0][quantity]": "1",
+      "metadata[source]": "chronotrade_subscription_plan",
+      "metadata[user_id]": user.id,
+      "metadata[plan_code]": plan.code,
+      "metadata[plan_name]": plan.name,
+      "metadata[monthly_credits]": String(plan.monthly_credits),
+      "metadata[deep_dives]": String(plan.deep_dives),
+      "subscription_data[metadata][source]": "chronotrade_subscription_plan",
+      "subscription_data[metadata][user_id]": user.id,
+      "subscription_data[metadata][plan_code]": plan.code,
+      "subscription_data[metadata][plan_name]": plan.name,
+      "subscription_data[metadata][monthly_credits]": String(plan.monthly_credits),
+      "subscription_data[metadata][deep_dives]": String(plan.deep_dives),
+      success_url: returnUrl.toString(),
+      cancel_url: `${SITE_ORIGIN}/dashboard/commandes/?subscription=cancel`
+    });
+    if (plan.stripe_price_id) {
+      body.set("line_items[0][price]", plan.stripe_price_id);
+    } else {
+      body.set("line_items[0][price_data][currency]", String(plan.currency || "EUR").toLowerCase());
+      body.set("line_items[0][price_data][unit_amount]", String(plan.price_cents));
+      body.set("line_items[0][price_data][recurring][interval]", "month");
+      body.set("line_items[0][price_data][product_data][name]", `ChronoTrade ${plan.name}`);
+      body.set("line_items[0][price_data][product_data][description]", `${plan.monthly_credits} credits mensuels et ${plan.deep_dives} approfondissements inclus.`);
+    }
+    const { stripeResponse, session } = await createStripeCheckoutSession(body);
+    if (!stripeResponse.ok || !session.url) return jsonResponse(res, 502, { ok: false, error: session.error?.message || "Abonnement indisponible." });
+    return jsonResponse(res, 200, { ok: true, url: session.url, id: session.id, plan });
   } catch (error) {
     return jsonResponse(res, 500, { ok: false, error: error.message });
   }
@@ -4977,6 +5641,9 @@ createServer((req, res) => {
   if (req.method === "GET" && url.pathname === "/api/site-reviews") return handleSiteReviews(res, url);
   if (req.method === "POST" && url.pathname === "/api/site-reviews") return handleSiteReviewSubmit(req, res);
   if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/checkout/session") return handleDynamicCheckoutSession(req, res, url);
+  if (req.method === "GET" && url.pathname === "/api/wallet/summary") return handleWalletSummary(req, res);
+  if (req.method === "POST" && url.pathname === "/api/checkout/credits/session") return handleCreditCheckoutSession(req, res);
+  if (req.method === "POST" && url.pathname === "/api/billing/subscription/session") return handleSubscriptionCheckoutSession(req, res);
   if (req.method === "GET" && url.pathname === "/api/checkout/product") return handleDynamicCheckoutRedirect(res, url);
   if (req.method === "GET" && url.pathname === "/api/checkout/analyse-express") return handleAnalyseExpressCheckout(res);
   if (req.method === "POST" && url.pathname === "/api/checkout/analyse-express/session") return handleAnalyseExpressEmbeddedCheckout(req, res);

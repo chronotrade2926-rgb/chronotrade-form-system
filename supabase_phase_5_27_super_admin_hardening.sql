@@ -1,25 +1,23 @@
 -- Phase 5.27 - Super-admin hardening
--- Locks the owner role to the two real ChronoTrade owner emails.
+-- Locks the owner role to the single real ChronoTrade owner email.
 -- Prevents client-side role escalation through public.users updates.
 
 insert into public.admin_emails(email)
 values
-  ('bouchonnetflorent@gmail.com'),
-  ('chronotrade2926@gmail.com'),
-  ('flo.chronotrade@outlook.fr')
+  ('bouchonnetflorent@gmail.com')
 on conflict (email) do nothing;
 
 delete from public.admin_emails
-where lower(email) in ('bouchonneflorent@gmail.com', 'chronotrade29-26@gmail.com');
+where lower(email) in ('bouchonneflorent@gmail.com', 'chronotrade2926@gmail.com', 'chronotrade29-26@gmail.com', 'flo.chronotrade@outlook.fr');
 
 update public.users
 set role = 'admin', updated_at = now()
 where role = 'super_admin'
-  and lower(email) not in ('bouchonnetflorent@gmail.com', 'chronotrade2926@gmail.com');
+  and lower(email) <> 'bouchonnetflorent@gmail.com';
 
 update public.users
 set role = 'super_admin', updated_at = now()
-where lower(email) in ('bouchonnetflorent@gmail.com', 'chronotrade2926@gmail.com');
+where lower(email) = 'bouchonnetflorent@gmail.com';
 
 create or replace function public.is_super_admin_user()
 returns boolean
@@ -33,7 +31,7 @@ as $$
     from public.users u
     where u.id = (select auth.uid())
       and u.role = 'super_admin'
-      and lower(u.email) in ('bouchonnetflorent@gmail.com', 'chronotrade2926@gmail.com')
+      and lower(u.email) = 'bouchonnetflorent@gmail.com'
   );
 $$;
 
@@ -52,7 +50,7 @@ as $$
         u.role = 'admin'
         or (
           u.role = 'super_admin'
-          and lower(u.email) in ('bouchonnetflorent@gmail.com', 'chronotrade2926@gmail.com')
+          and lower(u.email) = 'bouchonnetflorent@gmail.com'
         )
       )
   );
@@ -71,12 +69,12 @@ begin
   normalized_email := lower(coalesce(new.email, ''));
   db_role := current_setting('role', true);
 
-  if normalized_email in ('bouchonnetflorent@gmail.com', 'chronotrade2926@gmail.com') then
+  if normalized_email = 'bouchonnetflorent@gmail.com' then
     new.role := 'super_admin';
   end if;
 
   if new.role = 'super_admin'
-    and normalized_email not in ('bouchonnetflorent@gmail.com', 'chronotrade2926@gmail.com') then
+    and normalized_email <> 'bouchonnetflorent@gmail.com' then
     raise exception 'super_admin role is restricted to ChronoTrade owner accounts';
   end if;
 
@@ -89,7 +87,7 @@ begin
 
   if tg_op = 'UPDATE'
     and old.role = 'super_admin'
-    and lower(coalesce(old.email, '')) in ('bouchonnetflorent@gmail.com', 'chronotrade2926@gmail.com')
+    and lower(coalesce(old.email, '')) = 'bouchonnetflorent@gmail.com'
     and normalized_email <> lower(coalesce(old.email, '')) then
     raise exception 'super_admin owner email cannot be changed from the public profile table';
   end if;
@@ -133,7 +131,7 @@ with check (
 );
 
 insert into public.admin_activity_log(actor_id, action, entity_type, metadata)
-select null, 'super_admin_hardening_applied', 'security', '{"phase":"5.27","super_admin_emails":["bouchonnetflorent@gmail.com","chronotrade2926@gmail.com"]}'::jsonb
+select null, 'super_admin_hardening_applied', 'security', '{"phase":"5.27","super_admin_emails":["bouchonnetflorent@gmail.com"]}'::jsonb
 where exists (
   select 1
   from information_schema.tables
