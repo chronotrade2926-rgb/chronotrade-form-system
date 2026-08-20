@@ -48,7 +48,7 @@ const DEFAULT_BILLING_PLANS = [
 ];
 const SUPER_ADMIN_EMAILS = new Set(
   (process.env.CHRONOTRADE_SUPER_ADMIN_EMAILS ||
-    "bouchonnetflorent@gmail.com")
+    "bouchonneflorent@gmail.com")
     .split(",")
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean)
