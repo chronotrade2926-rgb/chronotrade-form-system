@@ -3906,6 +3906,8 @@ async function handleResolveClarification(req, res, needId) {
       question_selector: {
         selected_question: reasoningState.selected_question,
         reason: reasoningState.selected_question_reason,
+        should_ask: Boolean(reasoningState.selected_question),
+        next_recommended_step: reasoningState.next_action,
         asks_one_question_by_default: true
       },
       matches: (ai?.matches || []).map((match) => ({
