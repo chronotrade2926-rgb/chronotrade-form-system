@@ -1631,11 +1631,20 @@ function openAIUsageSummary(payload = {}, durationMs = null, model = OPENAI_NEED
   };
 }
 
+function isPromptHelpText(rawText = "") {
+  const text = normalizeForScoring(rawText);
+  return text.includes("sais pas quoi ecrire")
+    || text.includes("ne sais pas quoi ecrire")
+    || text.includes("quoi ecrire")
+    || text.includes("je dois mettre quoi")
+    || text.includes("comment demander");
+}
+
 function fallbackNeedAnalysis(need, risk = null) {
   const text = normalizeForScoring(need.raw_text);
   const tags = [];
   const add = (tag) => { if (!tags.includes(tag)) tags.push(tag); };
-  const needsPromptHelp = text.includes("sais pas quoi ecrire") || text.includes("ne sais pas quoi ecrire") || text.includes("quoi ecrire") || text.includes("je dois mettre quoi") || text.includes("comment demander");
+  const needsPromptHelp = isPromptHelpText(need.raw_text);
   if (text.includes("avis") || text.includes("google")) add("avis Google");
   if (text.includes("automatis") || text.includes("temps") || text.includes("repet")) add("automatisation");
   if (text.includes("site") || text.includes("landing")) add("site web");
@@ -1717,11 +1726,14 @@ function interactionProfileFromNeed(need = {}) {
   const profile = metadata.interaction_profile || need.interaction_profile || {};
   const signals = metadata.interaction_signals || need.interaction_signals || {};
   const value = (key, fallback = "") => cleanString(profile?.[key]?.value || profile?.[key] || signals?.[key] || fallback);
+  const explicitSegment = cleanString(profile?.segment || signals?.segment || "");
   const guidance = value("guidance_need", "medium");
   const depth = value("preferred_explanation_depth", "balanced");
   const technical = value("technical_familiarity", "unknown");
   const control = value("control_preference", "normal");
   let segment = "balanced";
+  if (["novice", "novice_control", "guided"].includes(explicitSegment)) segment = "novice_control";
+  if (["advanced", "avance", "experienced", "expert", "direct"].includes(explicitSegment)) segment = "experienced";
   if (guidance === "high" || depth === "guided" || technical === "low") segment = "novice_control";
   if (depth === "direct" || technical === "medium_high") segment = "experienced";
   return {
@@ -1806,6 +1818,9 @@ function selectedQuestionForNeed(analysis = {}, hypotheses = [], matches = []) {
 
 function publicFreePlan(analysis = {}, matches = [], need = {}) {
   const text = normalizeForScoring([need.raw_text, analysis.summary, analysis.primary_problem, analysis.desired_outcome, analysis.category, ...(analysis.solution_tags || [])].join(" "));
+  if (isPromptHelpText(need.raw_text)) {
+    return ["Ecrivez une phrase brute, meme mal formulee : ce qui vous bloque, ce qui revient souvent ou ce que vous aimeriez ameliorer.", "Ajoutez un exemple concret si vous en avez un : une situation recente, une tache penible, un objectif ou une frustration.", "Indiquez ce que vous voudriez obtenir a la place : gagner du temps, comprendre quoi faire, trouver des clients, mieux vous organiser.", "Envoyez cette version simple. ChronoTrade pourra ensuite poser une seule precision utile si elle change vraiment la prochaine action."];
+  }
   if (["client", "prospect", "vente", "conversion", "activite", "priorite"].some((word) => text.includes(word))) {
     return ["Reformuler l'offre en une phrase claire.", "Identifier la cible prioritaire.", "Verifier le canal qui devrait amener les clients.", "Choisir un seul point a tester cette semaine : offre, preuve, visibilite, conversion ou relance."];
   }
@@ -1825,6 +1840,11 @@ function buildPublicReasoningState({ need = {}, analysis = {}, matches = [], sta
   const hypotheses = publicHypothesesForNeed(analysis, matches, need);
   const selectedQuestion = selectedQuestionForNeed(analysis, hypotheses, matches);
   const profile = interactionProfileFromNeed(need);
+  const presentation = profile.segment === "novice_control"
+    ? { mode: "guided", detail_level: "simple", guidance: "Utiliser des phrases courtes, rassurer l'utilisateur et expliquer pourquoi la prochaine action est proposee." }
+    : profile.segment === "experienced"
+      ? { mode: "direct", detail_level: "compact", guidance: "Aller droit au diagnostic, eviter les explications elementaires et donner la prochaine action rapidement." }
+      : { mode: "balanced", detail_level: "standard", guidance: "Rester clair, concret et assez court, avec une explication utile mais non technique." };
   return {
     raw_problem_text: cleanString(need.raw_text),
     detected_domain: cleanString(analysis.category || need.detected_category || "Besoin a qualifier"),
@@ -1844,6 +1864,7 @@ function buildPublicReasoningState({ need = {}, analysis = {}, matches = [], sta
     plan: publicFreePlan(analysis, matches, need),
     result_feedback: feedback || null,
     interaction_profile_used: profile,
+    presentation,
     status,
     privacy_note: "Etat explicatif public : aucune chaine de pensee privee brute n'est exposee."
   };
@@ -2200,9 +2221,13 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
         analysis = fallbackNeedAnalysis(need, null);
       }
     }
+    const wantsPromptHelp = isPromptHelpText(need.raw_text);
     const risk = payloadRisk || detectResolveRiskServer(need.raw_text);
     if (analysis) {
       // UsageGate blocked the paid path. Keep the raw need and return a safe free fallback.
+    } else if (wantsPromptHelp) {
+      analysis = fallbackNeedAnalysis(need, null);
+      aiStatus = "skipped_prompt_help";
     } else if (risk) {
       analysis = fallbackNeedAnalysis(need, risk);
       aiStatus = "skipped";
@@ -3738,6 +3763,8 @@ async function handleResolveNeed(req, res) {
       question_selector: {
         selected_question: reasoningState.selected_question,
         reason: reasoningState.selected_question_reason,
+        should_ask: Boolean(reasoningState.selected_question),
+        next_recommended_step: reasoningState.next_action,
         asks_one_question_by_default: true
       },
       similarCount,
