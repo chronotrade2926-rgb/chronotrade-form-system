@@ -1775,9 +1775,18 @@ function publicHypothesesForNeed(analysis = {}, matches = [], need = {}) {
   return rows.slice(0, 3);
 }
 
-function selectedQuestionForNeed(analysis = {}, hypotheses = []) {
+function selectedQuestionForNeed(analysis = {}, hypotheses = [], matches = []) {
   const questions = arrayOfCleanStrings(analysis.suggested_questions, 3);
   const question = questions[0] || "";
+  const confidence = Number(analysis.confidence_score || 0);
+  const hasActionableMatch = Array.isArray(matches) && matches.some((match) => Number(match.score || 0) >= AI_MATCH_THRESHOLD_LOW);
+  if (hasActionableMatch && confidence >= 0.6) {
+    return {
+      question: null,
+      reason: "Une action utile est deja possible avec les informations actuelles ; ChronoTrade ne pose donc pas de question supplementaire.",
+      should_ask: false
+    };
+  }
   if (!question) {
     return {
       question: null,
@@ -1814,7 +1823,7 @@ function publicFreePlan(analysis = {}, matches = [], need = {}) {
 
 function buildPublicReasoningState({ need = {}, analysis = {}, matches = [], status = "", clarification = null, feedback = null } = {}) {
   const hypotheses = publicHypothesesForNeed(analysis, matches, need);
-  const selectedQuestion = selectedQuestionForNeed(analysis, hypotheses);
+  const selectedQuestion = selectedQuestionForNeed(analysis, hypotheses, matches);
   const profile = interactionProfileFromNeed(need);
   return {
     raw_problem_text: cleanString(need.raw_text),
