@@ -1806,11 +1806,11 @@ function selectedQuestionForNeed(analysis = {}, hypotheses = [], matches = []) {
 
 function publicFreePlan(analysis = {}, matches = [], need = {}) {
   const text = normalizeForScoring([need.raw_text, analysis.summary, analysis.primary_problem, analysis.desired_outcome, analysis.category, ...(analysis.solution_tags || [])].join(" "));
-  if (["mental", "stress", "sante", "fatigue", "motivation"].some((word) => text.includes(word))) {
-    return ["Choisir une micro-action faisable aujourd'hui.", "La tester sur une duree courte.", "Noter l'effet observe.", "Demander un avis humain qualifie si la situation est sensible ou durable."];
-  }
   if (["client", "prospect", "vente", "conversion", "activite", "priorite"].some((word) => text.includes(word))) {
     return ["Reformuler l'offre en une phrase claire.", "Identifier la cible prioritaire.", "Verifier le canal qui devrait amener les clients.", "Choisir un seul point a tester cette semaine : offre, preuve, visibilite, conversion ou relance."];
+  }
+  if (["mental", "stress", "sante", "fatigue", "motivation"].some((word) => text.includes(word))) {
+    return ["Choisir une micro-action faisable aujourd'hui.", "La tester sur une duree courte.", "Noter l'effet observe.", "Demander un avis humain qualifie si la situation est sensible ou durable."];
   }
   if (["temps", "automatisation", "ia", "workflow", "relance"].some((word) => text.includes(word))) {
     return ["Lister les trois taches repetitives.", "Estimer le temps perdu par semaine.", "Choisir une seule tache a simplifier en premier.", "Verifier que la solution peut etre testee sans casser le processus actuel."];
