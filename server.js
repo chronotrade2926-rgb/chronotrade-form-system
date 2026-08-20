@@ -39,6 +39,8 @@ const CREDIT_MIN_PURCHASE_EUR = Number(process.env.CHRONOTRADE_CREDIT_MIN_PURCHA
 const CREDITS_PER_EUR = Number(process.env.CHRONOTRADE_CREDITS_PER_EUR || 10);
 const FREE_MONTHLY_CREDITS = Number(process.env.CHRONOTRADE_FREE_MONTHLY_CREDITS || 100);
 const WELCOME_CREDITS = Number(process.env.CHRONOTRADE_WELCOME_CREDITS || 100);
+const USAGE_GATE_ENFORCED = String(process.env.CHRONOTRADE_USAGE_GATE_ENFORCED || "").toLowerCase() === "true";
+const USAGE_GATE_NEED_ANALYSIS_CREDITS = Math.max(1, Number(process.env.CHRONOTRADE_USAGE_GATE_NEED_ANALYSIS_CREDITS || 1));
 const DEFAULT_BILLING_PLANS = [
   { code: "essentiel", name: "Essentiel", price_cents: 2000, currency: "EUR", monthly_credits: 250, deep_dives: 5, features: ["Socle gratuit conserve", "Conversations sauvegardees", "Alertes", "Profil d'interaction"] },
   { code: "pro", name: "Pro", price_cents: 5000, currency: "EUR", monthly_credits: 700, deep_dives: 12, features: ["Tout Essentiel", "Limites d'analyse superieures", "Personnalisation avancee", "Memoire plus longue selon disponibilite"] },
@@ -1576,7 +1578,8 @@ async function callNeedAnalysisModel({ need, prompt }) {
               prompt.prompt,
               "Tu ne dois pas afficher de raisonnement interne.",
               "Tu ne dois pas inventer de produit, service ou partenaire comme disponible.",
-              "Si le besoin manque d'informations, propose 1 a 3 questions maximum.",
+              "Si le besoin manque d'informations, propose une seule question prioritaire par defaut, uniquement si sa reponse peut changer la prochaine action. Tu peux proposer jusqu'a 3 questions seulement si elles sont vraiment critiques.",
+              "Adapte le niveau de langage au profil d'interaction fourni sans changer le fond logique.",
               "Retourne uniquement l'objet JSON conforme au schema."
             ].join("\n")
           },
@@ -1585,6 +1588,7 @@ async function callNeedAnalysisModel({ need, prompt }) {
             content: [
               `Besoin brut: ${modelInputText}`,
               `Profil: ${need.user_type || "non precise"}`,
+              `Profil d'interaction: ${JSON.stringify(interactionProfileFromNeed(need))}`,
               `Secteur: ${need.industry || "non precise"}`,
               `Objectif detecte: ${need.objective || "non precise"}`,
               `Urgence/priorite: ${need.priority || need.urgency || "non precise"}`
@@ -1705,6 +1709,134 @@ function boostAnalysisWithBusinessSignals(analysis, need) {
     confidence_score: Math.max(Number(analysis.confidence_score || 0), 0.68),
     needs_clarification: false,
     user_facing_suggestion: analysis.user_facing_suggestion || "Commencez par isoler le vrai blocage : offre, cible, visibilite, confiance, tunnel ou relance. La prochaine action la plus logique est un diagnostic court avec priorites claires, puis seulement ensuite une action commerciale ou technique."
+  };
+}
+
+function interactionProfileFromNeed(need = {}) {
+  const metadata = need.metadata && typeof need.metadata === "object" ? need.metadata : {};
+  const profile = metadata.interaction_profile || need.interaction_profile || {};
+  const signals = metadata.interaction_signals || need.interaction_signals || {};
+  const value = (key, fallback = "") => cleanString(profile?.[key]?.value || profile?.[key] || signals?.[key] || fallback);
+  const guidance = value("guidance_need", "medium");
+  const depth = value("preferred_explanation_depth", "balanced");
+  const technical = value("technical_familiarity", "unknown");
+  const control = value("control_preference", "normal");
+  let segment = "balanced";
+  if (guidance === "high" || depth === "guided" || technical === "low") segment = "novice_control";
+  if (depth === "direct" || technical === "medium_high") segment = "experienced";
+  return {
+    segment,
+    guidance_need: guidance,
+    preferred_explanation_depth: depth,
+    technical_familiarity: technical,
+    control_preference: control
+  };
+}
+
+function publicHypothesesForNeed(analysis = {}, matches = [], need = {}) {
+  const text = normalizeForScoring([
+    need.raw_text,
+    analysis.summary,
+    analysis.primary_problem,
+    analysis.desired_outcome,
+    analysis.category,
+    ...(analysis.solution_tags || [])
+  ].join(" "));
+  const rows = [];
+  const push = (id, label, support, weakens, status, confidence = 0.5) => {
+    rows.push({
+      id,
+      label,
+      status,
+      confidence: clampScore(confidence, 0.5),
+      supports: arrayOfCleanStrings(Array.isArray(support) ? support : [support], 4),
+      weakens: arrayOfCleanStrings(Array.isArray(weakens) ? weakens : [weakens], 4)
+    });
+  };
+  if (["client", "clients", "prospect", "vente", "conversion", "visibilite", "acquisition"].some((word) => text.includes(word))) {
+    push("H1", "Blocage d'acquisition ou de conversion", "La demande parle de clients, ventes, prospects ou visibilite.", need.raw_text?.includes("Precision utilisateur:") ? "La precision peut deplacer le blocage vers l'offre ou le message." : "Le canal et la cible ne sont pas encore confirms.", matches.length ? "strengthened" : "active", matches.length ? 0.78 : 0.64);
+  }
+  if (["offre", "message", "positionnement", "cible", "priorite", "diagnostic", "audit"].some((word) => text.includes(word))) {
+    push("H2", "Offre ou priorite a clarifier", "Le besoin cherche quoi ameliorer ou par ou commencer.", matches.length ? "" : "Aucune preuve externe ne confirme encore le vrai point faible.", matches.length ? "strengthened" : "active", matches.length ? 0.82 : 0.66);
+  }
+  if (["temps", "manuel", "relance", "workflow", "automatisation", "ia"].some((word) => text.includes(word))) {
+    push("H3", "Processus repetitif a simplifier", "La demande contient des signaux de perte de temps, relance ou automatisation.", "La frequence et les outils ne sont pas encore connus.", "active", 0.62);
+  }
+  if (["site", "landing", "logo", "marque", "branding", "image"].some((word) => text.includes(word))) {
+    push("H3", "Confiance digitale a renforcer", "La demande touche au site, a l'image ou a la presence digitale.", "Le probleme peut aussi venir de l'offre ou de l'acquisition.", matches.length ? "active" : "uncertain", 0.58);
+  }
+  if (["stress", "mental", "sante", "fatigue", "motivation", "quotidien", "organisation"].some((word) => text.includes(word))) {
+    push("H1", "Besoin personnel ou quotidien a traiter avec prudence", "La demande contient des signaux de bien-etre, energie ou organisation personnelle.", "ChronoTrade ne remplace pas un professionnel de sante ou un accompagnement humain.", "active", 0.6);
+  }
+  if (!rows.length) {
+    push("H1", "Besoin encore large", "Le texte brut donne une direction generale.", "Il manque le resultat attendu et la contrainte principale.", "uncertain", 0.42);
+    push("H2", "Clarification utile avant recommandation", "Une question peut eviter de proposer une solution trop vite.", "Une action gratuite reste possible meme avec cette incertitude.", "active", 0.55);
+  }
+  return rows.slice(0, 3);
+}
+
+function selectedQuestionForNeed(analysis = {}, hypotheses = []) {
+  const questions = arrayOfCleanStrings(analysis.suggested_questions, 3);
+  const question = questions[0] || "";
+  if (!question) {
+    return {
+      question: null,
+      reason: "Aucune question supplementaire n'est necessaire pour proposer une premiere action utile.",
+      should_ask: false
+    };
+  }
+  const uncertain = hypotheses.find((row) => ["uncertain", "active"].includes(row.status));
+  return {
+    question,
+    reason: uncertain
+      ? `Cette precision peut changer la prochaine action liee a l'hypothese ${uncertain.id}.`
+      : "Cette precision peut confirmer la priorite avant de recommander une solution ChronoTrade.",
+    should_ask: true
+  };
+}
+
+function publicFreePlan(analysis = {}, matches = [], need = {}) {
+  const text = normalizeForScoring([need.raw_text, analysis.summary, analysis.primary_problem, analysis.desired_outcome, analysis.category, ...(analysis.solution_tags || [])].join(" "));
+  if (["mental", "stress", "sante", "fatigue", "motivation"].some((word) => text.includes(word))) {
+    return ["Choisir une micro-action faisable aujourd'hui.", "La tester sur une duree courte.", "Noter l'effet observe.", "Demander un avis humain qualifie si la situation est sensible ou durable."];
+  }
+  if (["client", "prospect", "vente", "conversion", "activite", "priorite"].some((word) => text.includes(word))) {
+    return ["Reformuler l'offre en une phrase claire.", "Identifier la cible prioritaire.", "Verifier le canal qui devrait amener les clients.", "Choisir un seul point a tester cette semaine : offre, preuve, visibilite, conversion ou relance."];
+  }
+  if (["temps", "automatisation", "ia", "workflow", "relance"].some((word) => text.includes(word))) {
+    return ["Lister les trois taches repetitives.", "Estimer le temps perdu par semaine.", "Choisir une seule tache a simplifier en premier.", "Verifier que la solution peut etre testee sans casser le processus actuel."];
+  }
+  if (["site", "marque", "logo", "branding", "image"].some((word) => text.includes(word))) {
+    return ["Definir ce que le visiteur doit comprendre en 5 secondes.", "Lister les preuves de confiance disponibles.", "Choisir l'action principale attendue.", "Retirer ce qui distrait de cette action."];
+  }
+  return ["Reformuler le probleme en une phrase.", "Ajouter le resultat attendu.", "Identifier la contrainte principale.", "Tester une petite action en moins de 48 heures."];
+}
+
+function buildPublicReasoningState({ need = {}, analysis = {}, matches = [], status = "", clarification = null, feedback = null } = {}) {
+  const hypotheses = publicHypothesesForNeed(analysis, matches, need);
+  const selectedQuestion = selectedQuestionForNeed(analysis, hypotheses);
+  const profile = interactionProfileFromNeed(need);
+  return {
+    raw_problem_text: cleanString(need.raw_text),
+    detected_domain: cleanString(analysis.category || need.detected_category || "Besoin a qualifier"),
+    objective: cleanString(analysis.desired_outcome || need.objective || need.detected_objective || "Trouver une prochaine action utile"),
+    explicit_facts: arrayOfCleanStrings([
+      cleanString(need.raw_text).slice(0, 240),
+      clarification?.answer ? `Precision: ${clarification.answer}` : ""
+    ], 6),
+    user_interpretation: cleanString(analysis.summary || analysis.primary_problem || need.title),
+    constraints: arrayOfCleanStrings([analysis.constraints, need.budget_range, need.urgency].filter(Boolean), 6),
+    unknowns: selectedQuestion.should_ask ? arrayOfCleanStrings([selectedQuestion.question, ...(analysis.suggested_questions || []).slice(1)], 4) : [],
+    hypotheses,
+    uncertainty_level: Number(analysis.confidence_score || 0) >= 0.75 ? "low" : Number(analysis.confidence_score || 0) >= 0.5 ? "medium" : "high",
+    selected_question: selectedQuestion.question,
+    selected_question_reason: selectedQuestion.reason,
+    next_action: selectedQuestion.should_ask && Number(analysis.confidence_score || 0) < 0.55 ? "ask_clarification" : matches.length ? "show_relevant_solution_and_free_plan" : "show_free_plan_and_save_interest",
+    plan: publicFreePlan(analysis, matches, need),
+    result_feedback: feedback || null,
+    interaction_profile_used: profile,
+    status,
+    privacy_note: "Etat explicatif public : aucune chaine de pensee privee brute n'est exposee."
   };
 }
 
@@ -2035,9 +2167,34 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
   let modelResult = null;
   let aiStatus = "completed";
   let errorMessage = "";
+  let usageReservation = { skipped: true, reason: USAGE_GATE_ENFORCED ? "no_authenticated_user" : "usage_gate_dry_run" };
+  const usageExternalReference = `need_analysis:${need.id}:${runId || "run"}:v1`;
   try {
+    if (USAGE_GATE_ENFORCED && need.user_id) {
+      usageReservation = await reserveUsageCredits({
+        userId: need.user_id,
+        operation: "need_analysis",
+        credits: USAGE_GATE_NEED_ANALYSIS_CREDITS,
+        externalReference: usageExternalReference,
+        metadata: {
+          need_id: need.id,
+          run_id: runId || null,
+          mode: "enforced",
+          consumption_order: ["free_entitlement", "subscription_entitlement", "wallet_credits"]
+        }
+      });
+      if (!usageReservation.ok) {
+        aiStatus = "blocked_usage_gate";
+        errorMessage = usageReservation.status === "insufficient_credits"
+          ? "Credits insuffisants pour lancer cette analyse."
+          : usageReservation.error || usageReservation.reason || "UsageGate a bloque l'analyse.";
+        analysis = fallbackNeedAnalysis(need, null);
+      }
+    }
     const risk = payloadRisk || detectResolveRiskServer(need.raw_text);
-    if (risk) {
+    if (analysis) {
+      // UsageGate blocked the paid path. Keep the raw need and return a safe free fallback.
+    } else if (risk) {
       analysis = fallbackNeedAnalysis(need, risk);
       aiStatus = "skipped";
     } else if (OPENAI_API_KEY) {
@@ -2051,6 +2208,15 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     analysis = fallbackNeedAnalysis(need, null);
     aiStatus = error.name === "AbortError" ? "timeout" : "failed";
     errorMessage = error.message;
+    if (usageReservation?.ok && usageReservation?.reservation?.id) {
+      await releaseUsageReservation({
+        reservationId: usageReservation.reservation.id,
+        userId: need.user_id,
+        reason: aiStatus,
+        metadata: { need_id: need.id, run_id: runId || null, error: errorMessage }
+      });
+      usageReservation = { ...usageReservation, released_after_error: true };
+    }
   }
   analysis = boostAnalysisWithBusinessSignals(analysis || fallbackNeedAnalysis(need, null), need);
   analysis.confidence_score = clampScore(analysis.confidence_score, 0);
@@ -2108,6 +2274,13 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
         : bestScore >= AI_MATCH_THRESHOLD_HIGH && analysis.confidence_score >= AI_MATCH_THRESHOLD_HIGH
           ? "MATCHED"
           : "ANALYZING";
+  const narrativeState = buildPublicReasoningState({
+    need,
+    analysis,
+    matches,
+    status: nextStatus,
+    feedback: need.metadata?.latest_feedback || null
+  });
   await supabaseUpdate("needs", {
     status: nextStatus,
     detected_category: analysis.category || need.detected_category,
@@ -2116,6 +2289,12 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     urgency: analysis.urgency === "unknown" ? need.urgency || null : analysis.urgency,
     budget_range: analysis.budget_if_mentioned || need.budget_range || null,
     is_unmet: nextStatus === "UNRESOLVED",
+    metadata: {
+      ...(need.metadata && typeof need.metadata === "object" ? need.metadata : {}),
+      narrative_state: narrativeState,
+      reasoning_state: narrativeState,
+      narrative_state_updated_at: new Date().toISOString()
+    },
     updated_at: new Date().toISOString()
   }, { id: `eq.${need.id}` }, { returnRepresentation: false });
   await recordNeedEvent(need.id, need.user_id, aiStatus === "completed" ? "ai_analysis_completed" : "ai_analysis_failed", { to_status: nextStatus, note: errorMessage || null, metadata: { confidence: analysis.confidence_score, matches: matches.length } });
@@ -2127,7 +2306,11 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     entityId: need.id,
     metadata: { confidence: analysis.confidence_score, matches: matches.length, status: nextStatus, runStatus: aiStatus }
   });
-  await recordUsageEvent({
+  const estimatedCreditsForUsage = estimatedUsageCredits(usageSummary) || USAGE_GATE_NEED_ANALYSIS_CREDITS;
+  const chargedUsageCredits = USAGE_GATE_ENFORCED && need.user_id && usageReservation?.ok && ["completed", "skipped"].includes(aiStatus)
+    ? Math.min(estimatedCreditsForUsage, Number(usageReservation.reservation?.reserved_credits || estimatedCreditsForUsage))
+    : 0;
+  const usageEvent = await recordUsageEvent({
     userId: need.user_id || null,
     needId: need.id,
     sessionId: need.session_id || null,
@@ -2136,7 +2319,7 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     model: modelUsed,
     usageSummary,
     status: aiStatus === "failed" || aiStatus === "timeout" ? "failed" : "recorded",
-    chargedCredits: 0,
+    chargedCredits: chargedUsageCredits,
     metadata: {
       run_id: runId || null,
       run_status: aiStatus,
@@ -2144,9 +2327,38 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
       next_status: nextStatus,
       confidence: analysis.confidence_score,
       matches: matches.length,
-      note: "Trace d'usage uniquement. Aucun debit credit sans reservation UsageGate."
+      usage_gate: {
+        enforced: USAGE_GATE_ENFORCED,
+        reservation_id: usageReservation?.reservation?.id || null,
+        reservation_status: usageReservation?.reservation?.status || usageReservation?.status || null,
+        dry_run: !USAGE_GATE_ENFORCED,
+        estimated_or_reserved_credits: USAGE_GATE_ENFORCED ? Number(usageReservation?.reservation?.reserved_credits || 0) : estimatedCreditsForUsage,
+        consumption_order: ["free_entitlement", "subscription_entitlement", "wallet_credits"]
+      },
+      note: USAGE_GATE_ENFORCED
+        ? "UsageGate actif : debit uniquement apres resultat livre."
+        : "UsageGate prepare en dry-run. Aucun debit credit reel sans CHRONOTRADE_USAGE_GATE_ENFORCED=true."
     }
   });
+  const usageEventId = Array.isArray(usageEvent.data) ? usageEvent.data[0]?.id : usageEvent.data?.id;
+  if (USAGE_GATE_ENFORCED && need.user_id && usageReservation?.ok && usageReservation?.reservation?.id) {
+    if (["failed", "timeout", "blocked_usage_gate"].includes(aiStatus)) {
+      await releaseUsageReservation({
+        reservationId: usageReservation.reservation.id,
+        userId: need.user_id,
+        reason: aiStatus,
+        metadata: { need_id: need.id, run_id: runId || null, usage_event_id: usageEventId || null }
+      });
+    } else {
+      await settleUsageReservation({
+        reservationId: usageReservation.reservation.id,
+        userId: need.user_id,
+        usageEventId,
+        chargedCredits: chargedUsageCredits,
+        metadata: { need_id: need.id, run_id: runId || null, delivered: true }
+      });
+    }
+  }
   if (matches.length) await recordNeedEvent(need.id, need.user_id, "ai_match_generated", { metadata: { bestScore, matches: matches.map((match) => ({ solution_id: match.solution_id, score: match.score })) } });
   if (matches.length) {
     await recordNeedEvent(need.id, need.user_id, "solution_proposed", { metadata: { bestScore, matches: matches.map((match) => ({ solution_id: match.solution_id, score: match.score, rank: match.rank })) } });
@@ -2199,7 +2411,7 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
       completed_at: new Date().toISOString()
     }, { id: `eq.${runId}` }, { returnRepresentation: false });
   }
-  return { ok: true, status: nextStatus, analysis, matches, runStatus: aiStatus, analysisInsert };
+  return { ok: true, status: nextStatus, analysis, matches, runStatus: aiStatus, analysisInsert, narrativeState, reasoningState: narrativeState };
 }
 
 async function supabaseAuthUser(req) {
@@ -3450,6 +3662,8 @@ async function handleResolveNeed(req, res) {
       is_unmet: Boolean(body.is_unmet || serverRisk),
       metadata: {
         ...(body.metadata && typeof body.metadata === "object" ? body.metadata : {}),
+        interaction_profile: body.interaction_profile && typeof body.interaction_profile === "object" ? body.interaction_profile : null,
+        interaction_signals: body.interaction_signals && typeof body.interaction_signals === "object" ? body.interaction_signals : null,
         serverRisk: serverRisk ? { status: serverRisk.status, reason: serverRisk.reason } : null
       }
     };
@@ -3491,6 +3705,12 @@ async function handleResolveNeed(req, res) {
       }, { id: `eq.${need.id}` }, { returnRepresentation: false });
     }
     const notification = { enabled: false, skipped: true, reason: "resolve_need_saved_dashboard_only" };
+    const reasoningState = ai?.reasoningState || ai?.narrativeState || buildPublicReasoningState({
+      need: { ...need, ...payload, id: need?.id },
+      analysis: ai?.analysis || {},
+      matches: ai?.matches || [],
+      status: ai?.status || payload.status
+    });
     return jsonResponse(res, 201, {
       ok: true,
       need: { id: need?.id || null, status: ai?.status || payload.status, ref: need?.id ? `REQ-${String(need.id).slice(0, 8).toUpperCase()}` : null },
@@ -3503,7 +3723,14 @@ async function handleResolveNeed(req, res) {
       },
       nextAction: ai?.analysis?.desired_outcome || ai?.analysis?.user_facing_suggestion || null,
       suggestion: ai?.analysis?.user_facing_suggestion || null,
-      questions: ai?.analysis?.suggested_questions || [],
+      questions: reasoningState.selected_question ? [reasoningState.selected_question] : [],
+      narrative_state: reasoningState,
+      reasoning_state: reasoningState,
+      question_selector: {
+        selected_question: reasoningState.selected_question,
+        reason: reasoningState.selected_question_reason,
+        asks_one_question_by_default: true
+      },
       similarCount,
       matches: (ai?.matches || []).map((match) => ({
         solutionId: match.solution_id,
@@ -3612,9 +3839,20 @@ async function handleResolveClarification(req, res, needId) {
     const enrichedNeed = {
       ...need,
       raw_text: `${need.raw_text}\n\nPrecision utilisateur: ${question}\n${answer}`,
-      status: "ANALYZING"
+      status: "ANALYZING",
+      metadata: {
+        ...(need.metadata || {}),
+        latest_clarification: { question, answer }
+      }
     };
     const ai = await analyzeNeedAfterSubmission(enrichedNeed, detectResolveRiskServer(enrichedNeed.raw_text));
+    const reasoningState = ai?.reasoningState || ai?.narrativeState || buildPublicReasoningState({
+      need: enrichedNeed,
+      analysis: ai?.analysis || {},
+      matches: ai?.matches || [],
+      status: ai?.status || "ANALYZING",
+      clarification: { question, answer }
+    });
     return jsonResponse(res, 201, {
       ok: true,
       status: ai?.status || "ANALYZING",
@@ -3625,15 +3863,14 @@ async function handleResolveClarification(req, res, needId) {
         category: ai?.analysis?.category || null,
         confidence: ai?.analysis?.confidence_score ?? null
       },
-      questions: ai?.analysis?.suggested_questions || [],
+      questions: reasoningState.selected_question ? [reasoningState.selected_question] : [],
       raw_text: enrichedNeed.raw_text,
-      reasoning_state: {
-        facts_explicit: [need.raw_text, answer].filter(Boolean),
-        interpretation_user: `${question} ${answer}`.trim(),
-        hypotheses: ai?.analysis?.solution_tags || [],
-        unknowns: ai?.analysis?.suggested_questions || [],
-        uncertainty_level: Number(ai?.analysis?.confidence_score || 0) >= 0.7 ? "low" : "medium",
-        updated_by: "clarification"
+      narrative_state: { ...reasoningState, updated_by: "clarification" },
+      reasoning_state: { ...reasoningState, updated_by: "clarification" },
+      question_selector: {
+        selected_question: reasoningState.selected_question,
+        reason: reasoningState.selected_question_reason,
+        asks_one_question_by_default: true
       },
       matches: (ai?.matches || []).map((match) => ({
         solutionId: match.solution_id,
