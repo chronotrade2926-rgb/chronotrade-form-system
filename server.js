@@ -41,6 +41,11 @@ const FREE_MONTHLY_CREDITS = Number(process.env.CHRONOTRADE_FREE_MONTHLY_CREDITS
 const WELCOME_CREDITS = Number(process.env.CHRONOTRADE_WELCOME_CREDITS || 100);
 const USAGE_GATE_ENFORCED = String(process.env.CHRONOTRADE_USAGE_GATE_ENFORCED || "").toLowerCase() === "true";
 const USAGE_GATE_NEED_ANALYSIS_CREDITS = Math.max(1, Number(process.env.CHRONOTRADE_USAGE_GATE_NEED_ANALYSIS_CREDITS || 1));
+const RESOLVE_SESSION_LIMIT_PER_HOUR = Math.max(1, Number(process.env.CHRONOTRADE_RESOLVE_SESSION_LIMIT_PER_HOUR || 8));
+const RESOLVE_IP_LIMIT_PER_HOUR = Math.max(5, Number(process.env.CHRONOTRADE_RESOLVE_IP_LIMIT_PER_HOUR || 40));
+const AI_DAILY_COST_LIMIT_USD = Math.max(0, Number(process.env.CHRONOTRADE_AI_DAILY_COST_LIMIT_USD || 5));
+const AI_COST_GUARD_ENABLED = String(process.env.CHRONOTRADE_AI_COST_GUARD_ENABLED || "true").toLowerCase() !== "false";
+const SECURITY_LOG_SALT = process.env.CHRONOTRADE_SECURITY_LOG_SALT || process.env.ADMIN_API_KEY || process.env.STRIPE_WEBHOOK_SECRET || "chronotrade-v1";
 const DEFAULT_BILLING_PLANS = [
   { code: "essentiel", name: "Essentiel", price_cents: 2000, currency: "EUR", monthly_credits: 250, deep_dives: 5, features: ["Socle gratuit conserve", "Conversations sauvegardees", "Alertes", "Profil d'interaction"] },
   { code: "pro", name: "Pro", price_cents: 5000, currency: "EUR", monthly_credits: 700, deep_dives: 12, features: ["Tout Essentiel", "Limites d'analyse superieures", "Personnalisation avancee", "Memoire plus longue selon disponibilite"] },
@@ -2237,6 +2242,162 @@ function estimatedUsageCredits(usageSummary = {}) {
   return Math.max(1, Math.ceil(eurEstimate * CREDITS_PER_EUR));
 }
 
+const resolveRateBuckets = new Map();
+
+function clientIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return forwarded || req.socket?.remoteAddress || "unknown";
+}
+
+function hashedLogValue(value) {
+  const clean = cleanString(value);
+  if (!clean) return null;
+  return createHmac("sha256", SECURITY_LOG_SALT).update(clean).digest("hex").slice(0, 24);
+}
+
+function pruneRateBuckets(now = Date.now()) {
+  for (const [key, bucket] of resolveRateBuckets.entries()) {
+    if (!bucket?.resetAt || bucket.resetAt < now) resolveRateBuckets.delete(key);
+  }
+}
+
+function bumpRateBucket(key, limit, now = Date.now()) {
+  const resetAt = now + 60 * 60 * 1000;
+  const existing = resolveRateBuckets.get(key);
+  const bucket = existing && existing.resetAt > now ? existing : { count: 0, resetAt };
+  bucket.count += 1;
+  resolveRateBuckets.set(key, bucket);
+  return {
+    allowed: bucket.count <= limit,
+    count: bucket.count,
+    limit,
+    resetAt: new Date(bucket.resetAt).toISOString()
+  };
+}
+
+async function recordSecurityEvent({
+  eventType,
+  severity = "info",
+  userId = null,
+  sessionId = "",
+  ip = "",
+  path = "",
+  reason = "",
+  metadata = {}
+} = {}) {
+  const safeMetadata = {
+    ...metadata,
+    session_hash: hashedLogValue(sessionId),
+    ip_hash: hashedLogValue(ip),
+    reason: cleanString(reason) || null
+  };
+  const payload = {
+    event_type: cleanString(eventType).slice(0, 90),
+    severity: cleanString(severity).slice(0, 40) || "info",
+    user_id: userId || null,
+    session_hash: safeMetadata.session_hash,
+    ip_hash: safeMetadata.ip_hash,
+    path: cleanString(path).slice(0, 240) || null,
+    reason: cleanString(reason).slice(0, 300) || null,
+    metadata: safeMetadata,
+    created_at: new Date().toISOString()
+  };
+  const securityLog = await supabaseInsert("security_events", payload);
+  const siteLog = await recordSiteEvent({
+    userId,
+    sessionId,
+    eventType: `security_${cleanString(eventType).slice(0, 70)}`,
+    entityType: "security",
+    path,
+    metadata: safeMetadata
+  });
+  return { securityLog, siteLog };
+}
+
+async function checkResolveRateLimit({ req, sessionId = "", userId = null } = {}) {
+  pruneRateBuckets();
+  const ip = clientIp(req);
+  const now = Date.now();
+  const checks = [];
+  if (sessionId) checks.push({ scope: "session", key: `session:${sessionId}`, limit: RESOLVE_SESSION_LIMIT_PER_HOUR });
+  checks.push({ scope: "ip", key: `ip:${ip}`, limit: RESOLVE_IP_LIMIT_PER_HOUR });
+  for (const check of checks) {
+    const result = bumpRateBucket(check.key, check.limit, now);
+    if (!result.allowed) {
+      await recordSecurityEvent({
+        eventType: "resolve_rate_limited",
+        severity: "warning",
+        userId,
+        sessionId,
+        ip,
+        path: "/api/resolve/needs",
+        reason: `${check.scope}_limit_exceeded`,
+        metadata: {
+          scope: check.scope,
+          count: result.count,
+          limit: result.limit,
+          reset_at: result.resetAt
+        }
+      });
+      return {
+        allowed: false,
+        code: "rate_limited",
+        scope: check.scope,
+        retry_after_seconds: Math.max(1, Math.ceil((new Date(result.resetAt).getTime() - now) / 1000)),
+        reset_at: result.resetAt
+      };
+    }
+  }
+  return { allowed: true, ip };
+}
+
+async function aiCostGuardSnapshot() {
+  if (!AI_COST_GUARD_ENABLED || !AI_DAILY_COST_LIMIT_USD) {
+    return { enabled: false, status: "disabled", daily_limit_usd: AI_DAILY_COST_LIMIT_USD };
+  }
+  const start = new Date();
+  start.setUTCHours(0, 0, 0, 0);
+  const result = await supabaseSelect("usage_events", {
+    select: "id,estimated_cost_usd,operation,provider,status,created_at",
+    created_at: `gte.${start.toISOString()}`,
+    order: "created_at.desc",
+    limit: "1000"
+  });
+  const rows = result.ok && Array.isArray(result.data) ? result.data : [];
+  const spent = rows.reduce((sum, row) => sum + Number(row.estimated_cost_usd || 0), 0);
+  const ratio = AI_DAILY_COST_LIMIT_USD > 0 ? spent / AI_DAILY_COST_LIMIT_USD : 0;
+  const status = ratio >= 1 ? "blocked" : ratio >= 0.95 ? "critical" : ratio >= 0.85 ? "warning" : ratio >= 0.7 ? "watch" : "ok";
+  return {
+    enabled: true,
+    status,
+    daily_limit_usd: AI_DAILY_COST_LIMIT_USD,
+    spent_today_usd: Number(spent.toFixed(6)),
+    ratio: Number(ratio.toFixed(4)),
+    events_today: rows.length,
+    storage: result.ok ? { ok: true } : { ok: false, error: result.message }
+  };
+}
+
+async function checkCostGuardBeforeAi({ needId = null, userId = null, sessionId = "", operation = "need_analysis" } = {}) {
+  const snapshot = await aiCostGuardSnapshot();
+  if (!snapshot.enabled || snapshot.status !== "blocked") return { allowed: true, snapshot };
+  await recordSecurityEvent({
+    eventType: "ai_cost_guard_blocked",
+    severity: "critical",
+    userId,
+    sessionId,
+    path: "/api/resolve/needs",
+    reason: "daily_ai_budget_reached",
+    metadata: { need_id: needId, operation, cost_guard: snapshot }
+  });
+  return {
+    allowed: false,
+    code: "cost_guard_blocked",
+    error: "Le budget IA journalier ChronoTrade est atteint. Le besoin est conserve et une reponse gratuite de secours est fournie.",
+    snapshot
+  };
+}
+
 async function recordUsageEvent({
   userId = null,
   needId = null,
@@ -2324,6 +2485,12 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     }
     const wantsPromptHelp = isPromptHelpText(need.raw_text);
     const risk = payloadRisk || detectResolveRiskServer(need.raw_text);
+    const costGuard = await checkCostGuardBeforeAi({
+      needId: need.id,
+      userId: need.user_id || null,
+      sessionId: need.session_id || "",
+      operation: "need_analysis"
+    });
     if (analysis) {
       // UsageGate blocked the paid path. Keep the raw need and return a safe free fallback.
     } else if (wantsPromptHelp) {
@@ -2332,6 +2499,10 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     } else if (risk) {
       analysis = fallbackNeedAnalysis(need, risk);
       aiStatus = "skipped";
+    } else if (!costGuard.allowed) {
+      analysis = fallbackNeedAnalysis(need, null);
+      aiStatus = "blocked_cost_guard";
+      errorMessage = costGuard.error || "Budget IA bloque par Cost Guard.";
     } else if (OPENAI_API_KEY) {
       modelResult = await callNeedAnalysisModel({ need, prompt });
       analysis = modelResult.analysis;
@@ -2477,7 +2648,7 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
   });
   const usageEventId = Array.isArray(usageEvent.data) ? usageEvent.data[0]?.id : usageEvent.data?.id;
   if (USAGE_GATE_ENFORCED && need.user_id && usageReservation?.ok && usageReservation?.reservation?.id) {
-    if (["failed", "timeout", "blocked_usage_gate"].includes(aiStatus)) {
+    if (["failed", "timeout", "blocked_usage_gate", "blocked_cost_guard"].includes(aiStatus)) {
       await releaseUsageReservation({
         reservationId: usageReservation.reservation.id,
         userId: need.user_id,
@@ -3761,6 +3932,17 @@ async function handleResolveNeed(req, res) {
       return jsonResponse(res, 422, { ok: false, error: "Consentement de service requis." });
     }
     const incomingSessionId = cleanString(body.session_id);
+    const rateLimit = await checkResolveRateLimit({ req, sessionId: incomingSessionId, userId: authUser?.id || null });
+    if (!rateLimit.allowed) {
+      return jsonResponse(res, 429, {
+        ok: false,
+        code: rateLimit.code || "rate_limited",
+        error: "Trop de demandes envoyees en peu de temps. Reessayez dans quelques minutes.",
+        scope: rateLimit.scope,
+        retry_after_seconds: rateLimit.retry_after_seconds,
+        reset_at: rateLimit.reset_at
+      });
+    }
     if (!authUser?.id && incomingSessionId) {
       const existingGuestNeeds = await supabaseSelect("needs", {
         select: "id,status,title,raw_text,created_at",
@@ -4258,7 +4440,8 @@ async function handleAdminResolveAnalytics(req, res) {
       runsResult,
       usageResult,
       ordersResult,
-      usersResult
+      usersResult,
+      securityResult
     ] = await Promise.all([
       adminSelectRows("needs", { select: "*", order: "created_at.desc", limit: "500" }),
       adminSelectRows("need_analysis", { select: "*", order: "created_at.desc", limit: "500" }),
@@ -4268,7 +4451,8 @@ async function handleAdminResolveAnalytics(req, res) {
       adminSelectRows("ai_analysis_runs", { select: "*", order: "created_at.desc", limit: "300" }),
       adminSelectRows("usage_events", { select: "*", order: "created_at.desc", limit: "500" }),
       adminSelectRows("orders_or_projects", { select: "*", order: "created_at.desc", limit: "300" }),
-      adminSelectRows("users", { select: "id,email,role,created_at", order: "created_at.desc", limit: "300" })
+      adminSelectRows("users", { select: "id,email,role,created_at", order: "created_at.desc", limit: "300" }),
+      adminSelectRows("security_events", { select: "*", order: "created_at.desc", limit: "300" })
     ]);
     const needs = needsResult.rows;
     const analyses = analysisResult.rows;
@@ -4279,6 +4463,8 @@ async function handleAdminResolveAnalytics(req, res) {
     const usage = usageResult.rows;
     const orders = ordersResult.rows;
     const users = usersResult.rows;
+    const security = securityResult.rows;
+    const costGuard = await aiCostGuardSnapshot();
     const analysisByNeed = Object.fromEntries(analyses.map((row) => [row.need_id, row]));
     const eventCounts = analyticsCountBy(events, (row) => row.event_type);
     const categoryRows = analyticsCountBy(needs, (need) => analysisByNeed[need.id]?.category || need.detected_category || need.detected_objective);
@@ -4336,7 +4522,28 @@ async function handleAdminResolveAnalytics(req, res) {
           { label: "cout_ia_estime_usd", value: Number(totalEstimatedCost.toFixed(6)) },
           { label: "tokens", value: totalTokens },
           { label: "credits_factures", value: chargedCredits }
-        ]
+        ],
+        security: analyticsCountBy(security, (row) => row.event_type).slice(0, 12)
+      },
+      controls: {
+        cost_guard: costGuard,
+        rate_limits: {
+          session_per_hour: RESOLVE_SESSION_LIMIT_PER_HOUR,
+          ip_per_hour: RESOLVE_IP_LIMIT_PER_HOUR,
+          active_buckets: resolveRateBuckets.size
+        },
+        security_monitor: {
+          events: security.length,
+          storage: securityResult.ok ? { ok: true } : { ok: false, error: securityResult.error },
+          recent: security.slice(0, 15).map((row) => ({
+            event_type: row.event_type,
+            severity: row.severity || "info",
+            reason: row.reason || row.metadata?.reason || null,
+            created_at: row.created_at,
+            session_hash: row.session_hash || row.metadata?.session_hash || null,
+            ip_hash: row.ip_hash || row.metadata?.ip_hash || null
+          }))
+        }
       },
       clusters,
       opportunities: clusters
@@ -4361,9 +4568,57 @@ async function handleAdminResolveAnalytics(req, res) {
         usage: usageResult.ok,
         orders: ordersResult.ok,
         users: usersResult.ok,
-        errors: [needsResult, analysisResult, eventsResult, feedbackResult, matchesResult, runsResult, usageResult, ordersResult, usersResult]
+        security: securityResult.ok,
+        cost_guard: costGuard.storage?.ok !== false,
+        errors: [needsResult, analysisResult, eventsResult, feedbackResult, matchesResult, runsResult, usageResult, ordersResult, usersResult, securityResult]
           .filter((item) => !item.ok)
           .map((item) => item.error)
+      }
+    });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
+async function handleAdminSecuritySummary(req, res) {
+  try {
+    const admin = await requireSupabaseSuperAdmin(req, res);
+    if (!admin) return;
+    const [securityResult, usageResult] = await Promise.all([
+      adminSelectRows("security_events", { select: "*", order: "created_at.desc", limit: "200" }),
+      adminSelectRows("usage_events", { select: "id,operation,provider,model,total_tokens,estimated_cost_usd,charged_credits,status,created_at", order: "created_at.desc", limit: "500" })
+    ]);
+    const costGuard = await aiCostGuardSnapshot();
+    return jsonResponse(res, 200, {
+      ok: true,
+      generated_at: new Date().toISOString(),
+      admin: { email: admin.profile?.email || admin.user?.email || null },
+      cost_guard: costGuard,
+      rate_limits: {
+        session_per_hour: RESOLVE_SESSION_LIMIT_PER_HOUR,
+        ip_per_hour: RESOLVE_IP_LIMIT_PER_HOUR,
+        active_buckets: resolveRateBuckets.size
+      },
+      security_monitor: {
+        events: securityResult.rows.length,
+        by_type: analyticsCountBy(securityResult.rows, (row) => row.event_type).slice(0, 20),
+        by_severity: analyticsCountBy(securityResult.rows, (row) => row.severity || "info").slice(0, 10),
+        recent: securityResult.rows.slice(0, 30).map((row) => ({
+          event_type: row.event_type,
+          severity: row.severity || "info",
+          reason: row.reason || row.metadata?.reason || null,
+          created_at: row.created_at,
+          session_hash: row.session_hash || row.metadata?.session_hash || null,
+          ip_hash: row.ip_hash || row.metadata?.ip_hash || null
+        })),
+        storage: securityResult.ok ? { ok: true } : { ok: false, error: securityResult.error }
+      },
+      usage_monitor: {
+        events: usageResult.rows.length,
+        by_operation: analyticsCountBy(usageResult.rows, (row) => row.operation).slice(0, 12),
+        estimated_cost_usd: Number(usageResult.rows.reduce((sum, row) => sum + Number(row.estimated_cost_usd || 0), 0).toFixed(6)),
+        charged_credits: usageResult.rows.reduce((sum, row) => sum + Number(row.charged_credits || 0), 0),
+        storage: usageResult.ok ? { ok: true } : { ok: false, error: usageResult.error }
       }
     });
   } catch (error) {
@@ -6238,6 +6493,7 @@ createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/api/admin/products/sync-stripe") return handleAdminProductSync(req, res);
   if (req.method === "POST" && url.pathname === "/api/admin/products/resolve-alerts") return handleAdminProductResolveAlerts(req, res);
   if (req.method === "GET" && url.pathname === "/api/admin/resolve/analytics") return handleAdminResolveAnalytics(req, res);
+  if (req.method === "GET" && url.pathname === "/api/admin/security/summary") return handleAdminSecuritySummary(req, res);
   if (req.method === "POST" && url.pathname.startsWith("/api/admin/needs/") && url.pathname.endsWith("/analyze")) {
     return handleAdminAnalyzeNeed(req, res, url.pathname.replace("/api/admin/needs/", "").replace("/analyze", ""));
   }
