@@ -1882,11 +1882,11 @@ function publicFreePlan(analysis = {}, matches = [], need = {}) {
   if (["papier", "papiers", "administratif", "dossier", "facture", "document"].some((word) => text.includes(word))) {
     return ["Rassembler tous les documents au meme endroit.", "Classer en trois piles : urgent, a traiter, archive.", "Choisir le dossier qui bloque le plus aujourd'hui.", "Faire une seule action courte : envoyer, scanner, relancer ou demander une piece manquante."];
   }
-  if (["apprendre", "formation", "cours", "etude", "etudier", "competence"].some((word) => text.includes(word))) {
-    return ["Definir la competence exacte a apprendre.", "Tester votre niveau actuel avec un exercice simple.", "Planifier trois sessions courtes cette semaine.", "Mesurer un resultat visible plutot qu'un temps passe."];
-  }
   if (["choix", "choisir", "decision", "hesite", "prioriser"].some((word) => text.includes(word))) {
     return ["Lister les options possibles.", "Choisir trois criteres non negociables.", "Noter le cout de l'inaction pour chaque option.", "Prendre une decision reversible en premier si c'est possible."];
+  }
+  if (["apprendre", "formation", "cours", "etude", "etudier", "competence"].some((word) => text.includes(word))) {
+    return ["Definir la competence exacte a apprendre.", "Tester votre niveau actuel avec un exercice simple.", "Planifier trois sessions courtes cette semaine.", "Mesurer un resultat visible plutot qu'un temps passe."];
   }
   if (["client", "prospect", "vente", "conversion", "activite", "priorite"].some((word) => text.includes(word))) {
     return ["Reformuler l'offre en une phrase claire.", "Identifier la cible prioritaire.", "Verifier le canal qui devrait amener les clients.", "Choisir un seul point a tester cette semaine : offre, preuve, visibilite, conversion ou relance."];
