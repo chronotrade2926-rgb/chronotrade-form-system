@@ -1651,6 +1651,25 @@ function fallbackNeedAnalysis(need, risk = null) {
   if (text.includes("logo") || text.includes("marque") || text.includes("branding")) add("branding");
   if (text.includes("application") || text.includes("app")) add("application");
   if (text.includes("partenaire") || text.includes("prestataire")) add("partenaire");
+  if (["cv", "candidature", "candidatures", "entretien", "emploi", "recruteur", "recruteurs", "poste"].some((word) => text.includes(word))) {
+    add("emploi");
+    add("candidature");
+  }
+  if (["couple", "relation", "dispute", "conjoint", "copine", "copain", "partenaire amoureux"].some((word) => text.includes(word))) {
+    add("relationnel");
+  }
+  if (["papier", "papiers", "administratif", "dossier", "facture", "factures", "document"].some((word) => text.includes(word))) {
+    add("administratif");
+  }
+  if (["apprendre", "formation", "cours", "etude", "etudier", "competence"].some((word) => text.includes(word))) {
+    add("apprentissage");
+  }
+  if (["choix", "choisir", "decision", "hesite", "prioriser"].some((word) => text.includes(word))) {
+    add("decision");
+  }
+  if (["projet", "organiser", "organisation", "planning", "retard", "deadline"].some((word) => text.includes(word))) {
+    add("organisation");
+  }
   if (text.includes("client") || text.includes("clients") || text.includes("vente") || text.includes("vendre") || text.includes("prospect") || text.includes("activite") || text.includes("priorite") || text.includes("ameliorer") || text.includes("pourquoi")) {
     add("audit");
     add("diagnostic");
@@ -1660,6 +1679,12 @@ function fallbackNeedAnalysis(need, risk = null) {
   if (needsPromptHelp) add("orientation");
   const category = needsPromptHelp ? "Orientation / clarification"
     : tags.includes("avis Google") ? "Reputation / fidelisation"
+    : tags.includes("emploi") ? "Travail / recherche d'emploi"
+    : tags.includes("relationnel") ? "Relationnel / communication"
+    : tags.includes("administratif") ? "Administratif / organisation"
+    : tags.includes("apprentissage") ? "Apprentissage / progression"
+    : tags.includes("decision") ? "Choix / decision"
+    : tags.includes("organisation") ? "Organisation / projets"
     : tags.includes("automatisation") ? "Automatisation / productivite"
     : tags.includes("site web") ? "Site / presence digitale"
     : tags.includes("branding") ? "Image / branding"
@@ -1668,6 +1693,18 @@ function fallbackNeedAnalysis(need, risk = null) {
     : "Besoin a qualifier";
   const facingSuggestion = needsPromptHelp
     ? "Pas besoin de formuler une demande parfaite. Commencez simplement par ce qui vous bloque, ce qui revient souvent, ce que vous aimeriez ameliorer ou ce que vous voulez eviter. ChronoTrade peut partir d'une phrase tres simple."
+    : tags.includes("emploi")
+    ? "Premiere action utile : distinguer le probleme entre ciblage des offres, CV, message de candidature, suivi ou preparation d'entretien. Commencez par noter combien de candidatures ont ete envoyees, combien de retours ont ete obtenus et quel type de poste est vise."
+    : tags.includes("relationnel")
+    ? "Premiere action utile : clarifier le fait concret, l'emotion ressentie et la demande precise a formuler, sans chercher a gagner un conflit. Si la situation implique violence, emprise ou danger, privilegiez un soutien humain qualifie."
+    : tags.includes("administratif")
+    ? "Premiere action utile : regrouper les documents, choisir une seule categorie prioritaire et definir la prochaine action administrative la plus courte."
+    : tags.includes("apprentissage")
+    ? "Premiere action utile : choisir une competence cible, mesurer le niveau actuel et planifier une micro-session concrete cette semaine."
+    : tags.includes("decision")
+    ? "Premiere action utile : poser les options, les criteres non negociables et le cout de ne rien choisir."
+    : tags.includes("organisation")
+    ? "Premiere action utile : transformer le projet en trois prochaines actions visibles, puis supprimer ou reporter ce qui n'est pas prioritaire."
     : tags.includes("audit")
     ? "Premiere action utile : clarifier ce qui bloque vraiment avant de depenser plus. Analysez l'offre, la cible, la preuve de confiance, le canal d'acquisition et la priorite commerciale. ChronoTrade peut vous orienter vers une Analyse Express pour recevoir un plan clair et priorise."
     : "Votre besoin a ete compris dans ses grandes lignes. ChronoTrade va chercher la solution la plus adaptee.";
@@ -1771,6 +1808,21 @@ function publicHypothesesForNeed(analysis = {}, matches = [], need = {}) {
   if (["offre", "message", "positionnement", "cible", "priorite", "diagnostic", "audit"].some((word) => text.includes(word))) {
     push("H2", "Offre ou priorite a clarifier", "Le besoin cherche quoi ameliorer ou par ou commencer.", matches.length ? "" : "Aucune preuve externe ne confirme encore le vrai point faible.", matches.length ? "strengthened" : "active", matches.length ? 0.82 : 0.66);
   }
+  if (["cv", "candidature", "candidatures", "entretien", "emploi", "poste", "recruteur"].some((word) => text.includes(word))) {
+    push("H1", "Blocage dans le parcours emploi", "La demande parle de candidature, CV, entretien ou reponse recruteur.", "Il manque le type de poste vise, le volume d'envois et le taux de retour.", "active", 0.66);
+  }
+  if (["couple", "relation", "dispute", "conjoint", "copine", "copain"].some((word) => text.includes(word))) {
+    push("H1", "Tension relationnelle ou communication a clarifier", "La demande touche a une relation personnelle ou a une situation de communication sensible.", "ChronoTrade ne doit pas remplacer un soutien humain qualifie en cas de danger ou de detresse.", "active", 0.58);
+  }
+  if (["papier", "papiers", "administratif", "dossier", "facture", "document"].some((word) => text.includes(word))) {
+    push("H2", "Charge administrative a organiser", "La demande contient des signaux de documents, dossiers ou taches administratives.", "La categorie exacte de document et l'echeance ne sont pas encore connues.", "active", 0.63);
+  }
+  if (["apprendre", "formation", "cours", "etude", "etudier", "competence"].some((word) => text.includes(word))) {
+    push("H2", "Progression ou apprentissage a structurer", "La demande parle d'apprendre, progresser ou acquerir une competence.", "Le niveau actuel, le temps disponible et l'objectif mesurable restent a preciser.", "active", 0.6);
+  }
+  if (["choix", "choisir", "decision", "hesite", "prioriser"].some((word) => text.includes(word))) {
+    push("H2", "Decision a cadrer", "La demande contient un choix ou une hesitation.", "Les criteres non negociables et le cout de l'inaction restent a clarifier.", "active", 0.6);
+  }
   if (["temps", "manuel", "relance", "workflow", "automatisation", "ia"].some((word) => text.includes(word))) {
     push("H3", "Processus repetitif a simplifier", "La demande contient des signaux de perte de temps, relance ou automatisation.", "La frequence et les outils ne sont pas encore connus.", "active", 0.62);
   }
@@ -1821,6 +1873,21 @@ function publicFreePlan(analysis = {}, matches = [], need = {}) {
   if (isPromptHelpText(need.raw_text)) {
     return ["Ecrivez une phrase brute, meme mal formulee : ce qui vous bloque, ce qui revient souvent ou ce que vous aimeriez ameliorer.", "Ajoutez un exemple concret si vous en avez un : une situation recente, une tache penible, un objectif ou une frustration.", "Indiquez ce que vous voudriez obtenir a la place : gagner du temps, comprendre quoi faire, trouver des clients, mieux vous organiser.", "Envoyez cette version simple. ChronoTrade pourra ensuite poser une seule precision utile si elle change vraiment la prochaine action."];
   }
+  if (["cv", "candidature", "candidatures", "entretien", "emploi", "poste", "recruteur"].some((word) => text.includes(word))) {
+    return ["Noter le poste exact vise et le nombre de candidatures envoyees.", "Comparer le CV et le message avec trois annonces ciblees.", "Identifier si le blocage vient du ciblage, du CV, du message ou du suivi.", "Modifier un seul element et mesurer les retours sur les 10 prochaines candidatures."];
+  }
+  if (["couple", "relation", "dispute", "conjoint", "copine", "copain"].some((word) => text.includes(word))) {
+    return ["Decrire un fait concret sans accusation.", "Nommer ce que vous ressentez et ce que vous voulez eviter.", "Formuler une demande simple et verifiable.", "Si la situation implique danger, violence ou emprise, chercher un soutien humain qualifie avant toute discussion."];
+  }
+  if (["papier", "papiers", "administratif", "dossier", "facture", "document"].some((word) => text.includes(word))) {
+    return ["Rassembler tous les documents au meme endroit.", "Classer en trois piles : urgent, a traiter, archive.", "Choisir le dossier qui bloque le plus aujourd'hui.", "Faire une seule action courte : envoyer, scanner, relancer ou demander une piece manquante."];
+  }
+  if (["apprendre", "formation", "cours", "etude", "etudier", "competence"].some((word) => text.includes(word))) {
+    return ["Definir la competence exacte a apprendre.", "Tester votre niveau actuel avec un exercice simple.", "Planifier trois sessions courtes cette semaine.", "Mesurer un resultat visible plutot qu'un temps passe."];
+  }
+  if (["choix", "choisir", "decision", "hesite", "prioriser"].some((word) => text.includes(word))) {
+    return ["Lister les options possibles.", "Choisir trois criteres non negociables.", "Noter le cout de l'inaction pour chaque option.", "Prendre une decision reversible en premier si c'est possible."];
+  }
   if (["client", "prospect", "vente", "conversion", "activite", "priorite"].some((word) => text.includes(word))) {
     return ["Reformuler l'offre en une phrase claire.", "Identifier la cible prioritaire.", "Verifier le canal qui devrait amener les clients.", "Choisir un seul point a tester cette semaine : offre, preuve, visibilite, conversion ou relance."];
   }
@@ -1840,28 +1907,62 @@ function buildPublicReasoningState({ need = {}, analysis = {}, matches = [], sta
   const hypotheses = publicHypothesesForNeed(analysis, matches, need);
   const selectedQuestion = selectedQuestionForNeed(analysis, hypotheses, matches);
   const profile = interactionProfileFromNeed(need);
+  const metadata = need.metadata && typeof need.metadata === "object" ? need.metadata : {};
+  const priorState = metadata.narrative_state && typeof metadata.narrative_state === "object" ? metadata.narrative_state : {};
+  const plan = publicFreePlan(analysis, matches, need);
+  const actionsProposed = arrayOfCleanStrings([
+    ...(Array.isArray(priorState.actions_proposed) ? priorState.actions_proposed : []),
+    selectedQuestion.should_ask ? `Question: ${selectedQuestion.question}` : plan[0],
+    matches[0]?.solution?.name ? `Solution ChronoTrade: ${matches[0].solution.name}` : ""
+  ], 8);
   const presentation = profile.segment === "novice_control"
     ? { mode: "guided", detail_level: "simple", guidance: "Utiliser des phrases courtes, rassurer l'utilisateur et expliquer pourquoi la prochaine action est proposee." }
     : profile.segment === "experienced"
       ? { mode: "direct", detail_level: "compact", guidance: "Aller droit au diagnostic, eviter les explications elementaires et donner la prochaine action rapidement." }
       : { mode: "balanced", detail_level: "standard", guidance: "Rester clair, concret et assez court, avec une explication utile mais non technique." };
   return {
+    problem_id: cleanString(need.id),
+    conversation_id: cleanString(need.conversation_id || need.session_id || need.id),
+    session_id: cleanString(need.session_id),
+    user_id_present: Boolean(need.user_id),
     raw_problem_text: cleanString(need.raw_text),
     detected_domain: cleanString(analysis.category || need.detected_category || "Besoin a qualifier"),
+    detected_subdomain: cleanString(analysis.subcategory || need.detected_objective || "general"),
     objective: cleanString(analysis.desired_outcome || need.objective || need.detected_objective || "Trouver une prochaine action utile"),
+    context: cleanString(analysis.primary_problem || need.title),
+    intent: cleanString(analysis.commercial_intent || "unknown"),
     explicit_facts: arrayOfCleanStrings([
+      ...(Array.isArray(priorState.explicit_facts) ? priorState.explicit_facts : []),
       cleanString(need.raw_text).slice(0, 240),
       clarification?.answer ? `Precision: ${clarification.answer}` : ""
     ], 6),
+    known_facts: arrayOfCleanStrings([
+      ...(Array.isArray(priorState.known_facts) ? priorState.known_facts : []),
+      cleanString(analysis.primary_problem || analysis.summary || need.title)
+    ], 8),
     user_interpretation: cleanString(analysis.summary || analysis.primary_problem || need.title),
     constraints: arrayOfCleanStrings([analysis.constraints, need.budget_range, need.urgency].filter(Boolean), 6),
     unknowns: selectedQuestion.should_ask ? arrayOfCleanStrings([selectedQuestion.question, ...(analysis.suggested_questions || []).slice(1)], 4) : [],
     hypotheses,
+    rejected_hypotheses: arrayOfCleanStrings([
+      ...(Array.isArray(priorState.rejected_hypotheses) ? priorState.rejected_hypotheses : []),
+      ...hypotheses.filter((row) => row.status === "rejected").map((row) => row.label)
+    ], 6),
     uncertainty_level: Number(analysis.confidence_score || 0) >= 0.75 ? "low" : Number(analysis.confidence_score || 0) >= 0.5 ? "medium" : "high",
     selected_question: selectedQuestion.question,
     selected_question_reason: selectedQuestion.reason,
     next_action: selectedQuestion.should_ask && Number(analysis.confidence_score || 0) < 0.55 ? "ask_clarification" : matches.length ? "show_relevant_solution_and_free_plan" : "show_free_plan_and_save_interest",
-    plan: publicFreePlan(analysis, matches, need),
+    next_useful_step: selectedQuestion.should_ask ? selectedQuestion.question : plan[0],
+    action_proposed: plan[0],
+    actions_proposed: actionsProposed,
+    actions_tested: Array.isArray(priorState.actions_tested) ? priorState.actions_tested : [],
+    known_results: arrayOfCleanStrings([
+      ...(Array.isArray(priorState.known_results) ? priorState.known_results : []),
+      feedback?.comment || feedback?.resolution_result || ""
+    ], 6),
+    plan,
+    selected_solution: matches[0]?.solution?.name || null,
+    alternatives: matches.slice(1, 4).map((match) => match.solution?.name || match.solution_slug || "").filter(Boolean),
     result_feedback: feedback || null,
     interaction_profile_used: profile,
     presentation,
@@ -3659,10 +3760,35 @@ async function handleResolveNeed(req, res) {
     if (!body.consent_service) {
       return jsonResponse(res, 422, { ok: false, error: "Consentement de service requis." });
     }
+    const incomingSessionId = cleanString(body.session_id);
+    if (!authUser?.id && incomingSessionId) {
+      const existingGuestNeeds = await supabaseSelect("needs", {
+        select: "id,status,title,raw_text,created_at",
+        session_id: `eq.${incomingSessionId}`,
+        user_id: "is.null",
+        order: "created_at.asc",
+        limit: "1"
+      });
+      const existingNeed = existingGuestNeeds.ok && Array.isArray(existingGuestNeeds.data) ? existingGuestNeeds.data[0] : null;
+      if (existingNeed?.id) {
+        return jsonResponse(res, 429, {
+          ok: false,
+          code: "guest_trial_used",
+          error: "Votre premiere analyse gratuite est deja disponible. Creez un compte pour sauvegarder ce probleme et continuer.",
+          cta: "Sauvegarder mon probleme et continuer",
+          existing_need: {
+            id: existingNeed.id,
+            status: existingNeed.status,
+            title: existingNeed.title || String(existingNeed.raw_text || "").slice(0, 90),
+            created_at: existingNeed.created_at
+          }
+        });
+      }
+    }
     const serverRisk = detectResolveRiskServer(rawText);
     const payload = {
       user_id: authUser?.id || null,
-      session_id: cleanString(body.session_id) || randomUUID(),
+      session_id: incomingSessionId || randomUUID(),
       raw_text: rawText,
       title: cleanString(body.title) || (rawText.length > 82 ? `${rawText.slice(0, 79)}...` : rawText),
       status: serverRisk?.status || cleanString(body.status) || "NEW",
@@ -4057,6 +4183,192 @@ async function recordSiteEvent({ userId = null, sessionId = null, eventType, ent
     referrer: referrer ? cleanString(referrer).slice(0, 600) : null,
     metadata: metadata && typeof metadata === "object" ? metadata : {}
   });
+}
+
+function analyticsCountBy(rows = [], getter = () => "") {
+  const map = new Map();
+  for (const row of rows) {
+    const key = cleanString(getter(row)) || "A qualifier";
+    map.set(key, (map.get(key) || 0) + 1);
+  }
+  return Array.from(map.entries())
+    .map(([label, count]) => ({ label, count }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+}
+
+function analyticsByDay(rows = [], days = 30) {
+  const now = Date.now();
+  const start = now - (days - 1) * 86400000;
+  const map = new Map();
+  for (let i = 0; i < days; i += 1) {
+    const day = new Date(start + i * 86400000).toISOString().slice(0, 10);
+    map.set(day, 0);
+  }
+  for (const row of rows) {
+    const day = String(row.created_at || "").slice(0, 10);
+    if (map.has(day)) map.set(day, (map.get(day) || 0) + 1);
+  }
+  return Array.from(map.entries()).map(([date, count]) => ({ date, count }));
+}
+
+function semanticClusterForProblem(row = {}, analysis = {}) {
+  const text = normalizeForScoring([row.raw_text, row.title, analysis.category, analysis.subcategory, ...(analysis.solution_tags || [])].join(" "));
+  if (["cv", "candidature", "candidatures", "entretien", "emploi", "poste", "recruteur"].some((word) => text.includes(word))) return "Recherche d'emploi / obtenir des entretiens";
+  if (["client", "clients", "prospect", "vente", "conversion", "acquisition", "visibilite"].some((word) => text.includes(word))) return "Acquisition clients / conversion";
+  if (["temps", "relance", "manuel", "workflow", "automatisation", "paperasse"].some((word) => text.includes(word))) return "Temps perdu / automatisation";
+  if (["papier", "papiers", "administratif", "dossier", "facture", "document"].some((word) => text.includes(word))) return "Charge administrative";
+  if (["site", "landing", "logo", "marque", "branding", "image"].some((word) => text.includes(word))) return "Image digitale / confiance";
+  if (["couple", "relation", "dispute", "conjoint", "copine", "copain"].some((word) => text.includes(word))) return "Relationnel / communication";
+  if (["apprendre", "formation", "cours", "etude", "competence"].some((word) => text.includes(word))) return "Apprentissage / progression";
+  if (["choix", "choisir", "decision", "hesite", "prioriser"].some((word) => text.includes(word))) return "Choix / decision";
+  return cleanString(analysis.category || row.detected_category || row.detected_objective || "Autres problemes");
+}
+
+function anonymizedProblemExample(row = {}) {
+  const text = cleanString(row.raw_text || row.title || "");
+  return {
+    problem_id: row.id ? `REQ-${String(row.id).slice(0, 8).toUpperCase()}` : null,
+    created_at: row.created_at || null,
+    status: row.status || null,
+    excerpt: text.length > 180 ? `${text.slice(0, 177)}...` : text,
+    has_account: Boolean(row.user_id),
+    session_hint: row.session_id ? String(row.session_id).slice(0, 8) : null
+  };
+}
+
+async function adminSelectRows(table, params = {}) {
+  const result = await supabaseSelect(table, params);
+  return {
+    ok: Boolean(result.ok),
+    rows: result.ok && Array.isArray(result.data) ? result.data : [],
+    error: result.ok ? null : result.message || result.error || `Lecture ${table} indisponible.`
+  };
+}
+
+async function handleAdminResolveAnalytics(req, res) {
+  try {
+    const admin = await requireSupabaseSuperAdmin(req, res);
+    if (!admin) return;
+    const [
+      needsResult,
+      analysisResult,
+      eventsResult,
+      feedbackResult,
+      matchesResult,
+      runsResult,
+      usageResult,
+      ordersResult,
+      usersResult
+    ] = await Promise.all([
+      adminSelectRows("needs", { select: "*", order: "created_at.desc", limit: "500" }),
+      adminSelectRows("need_analysis", { select: "*", order: "created_at.desc", limit: "500" }),
+      adminSelectRows("need_events", { select: "*", order: "created_at.desc", limit: "500" }),
+      adminSelectRows("need_feedback", { select: "*", order: "created_at.desc", limit: "300" }),
+      adminSelectRows("need_solution_matches", { select: "*,solutions(name,type,slug)", order: "created_at.desc", limit: "500" }),
+      adminSelectRows("ai_analysis_runs", { select: "*", order: "created_at.desc", limit: "300" }),
+      adminSelectRows("usage_events", { select: "*", order: "created_at.desc", limit: "500" }),
+      adminSelectRows("orders_or_projects", { select: "*", order: "created_at.desc", limit: "300" }),
+      adminSelectRows("users", { select: "id,email,role,created_at", order: "created_at.desc", limit: "300" })
+    ]);
+    const needs = needsResult.rows;
+    const analyses = analysisResult.rows;
+    const events = eventsResult.rows;
+    const feedback = feedbackResult.rows;
+    const matches = matchesResult.rows;
+    const runs = runsResult.rows;
+    const usage = usageResult.rows;
+    const orders = ordersResult.rows;
+    const users = usersResult.rows;
+    const analysisByNeed = Object.fromEntries(analyses.map((row) => [row.need_id, row]));
+    const eventCounts = analyticsCountBy(events, (row) => row.event_type);
+    const categoryRows = analyticsCountBy(needs, (need) => analysisByNeed[need.id]?.category || need.detected_category || need.detected_objective);
+    const subcategoryRows = analyticsCountBy(needs, (need) => analysisByNeed[need.id]?.subcategory || "general");
+    const sourceRows = analyticsCountBy(needs, (need) => need.utm_source || need.source_channel || need.referrer || "direct");
+    const clusterMap = new Map();
+    for (const need of needs) {
+      const analysis = analysisByNeed[need.id] || {};
+      const cluster = semanticClusterForProblem(need, analysis);
+      const item = clusterMap.get(cluster) || { name: cluster, count: 0, unresolved: 0, matched: 0, examples: [], latest_at: null };
+      item.count += 1;
+      if (need.status === "UNRESOLVED" || need.is_unmet) item.unresolved += 1;
+      if (matches.some((match) => match.need_id === need.id)) item.matched += 1;
+      if (item.examples.length < 3) item.examples.push(anonymizedProblemExample(need));
+      if (!item.latest_at || String(need.created_at || "") > item.latest_at) item.latest_at = need.created_at || null;
+      clusterMap.set(cluster, item);
+    }
+    const clusters = Array.from(clusterMap.values()).sort((a, b) => b.count - a.count).slice(0, 20);
+    const resolvedCount = feedback.filter((row) => ["yes", "resolved", "success"].includes(String(row.resolution_result || row.result || "").toLowerCase())).length;
+    const partialCount = feedback.filter((row) => ["partial", "mixed"].includes(String(row.resolution_result || row.result || "").toLowerCase())).length;
+    const negativeCount = feedback.filter((row) => ["no", "failed", "negative"].includes(String(row.resolution_result || row.result || "").toLowerCase())).length;
+    const totalEstimatedCost = usage.reduce((sum, row) => sum + Number(row.estimated_cost_usd || 0), 0);
+    const totalTokens = usage.reduce((sum, row) => sum + Number(row.total_tokens || 0), 0);
+    const chargedCredits = usage.reduce((sum, row) => sum + Number(row.charged_credits || 0), 0);
+    const revenueCents = orders
+      .filter((order) => ["paid", "completed", "active"].includes(String(order.status || "").toLowerCase()))
+      .reduce((sum, order) => sum + Number(order.amount || order.amount_cents || 0), 0);
+    return jsonResponse(res, 200, {
+      ok: true,
+      generated_at: new Date().toISOString(),
+      admin: { email: admin.profile?.email || admin.user?.email || null },
+      overview: {
+        total_problems: needs.length,
+        anonymous_problems: needs.filter((need) => !need.user_id).length,
+        account_problems: needs.filter((need) => need.user_id).length,
+        unresolved: needs.filter((need) => need.status === "UNRESOLVED" || need.is_unmet).length,
+        matched: new Set(matches.map((match) => match.need_id).filter(Boolean)).size,
+        clarifications: events.filter((event) => event.event_type === "clarification_answered").length,
+        users: users.length,
+        feedback: feedback.length
+      },
+      charts: {
+        problems_by_day_30: analyticsByDay(needs, 30),
+        top_categories: categoryRows.slice(0, 12),
+        top_subcategories: subcategoryRows.slice(0, 12),
+        acquisition_sources: sourceRows.slice(0, 12),
+        events: eventCounts.slice(0, 16),
+        resolution: [
+          { label: "resolu", count: resolvedCount },
+          { label: "partiel", count: partialCount },
+          { label: "non_resolu", count: negativeCount }
+        ],
+        economy: [
+          { label: "revenus_suivis_eur", value: Number((revenueCents / 100).toFixed(2)) },
+          { label: "cout_ia_estime_usd", value: Number(totalEstimatedCost.toFixed(6)) },
+          { label: "tokens", value: totalTokens },
+          { label: "credits_factures", value: chargedCredits }
+        ]
+      },
+      clusters,
+      opportunities: clusters
+        .filter((cluster) => cluster.count >= 2 || cluster.unresolved > 0)
+        .slice(0, 8)
+        .map((cluster) => ({
+          cluster: cluster.name,
+          signal: cluster.unresolved > 0 ? "solution_insuffisante" : "besoin_recurrent",
+          count: cluster.count,
+          idea: cluster.unresolved > 0
+            ? "Etudier une solution ChronoTrade dediee ou un produit simple pour ce cluster."
+            : "Surveiller le cluster avant de creer une offre."
+        })),
+      recent_examples: needs.slice(0, 20).map(anonymizedProblemExample),
+      diagnostics: {
+        needs: needsResult.ok,
+        analysis: analysisResult.ok,
+        events: eventsResult.ok,
+        feedback: feedbackResult.ok,
+        matches: matchesResult.ok,
+        runs: runsResult.ok,
+        usage: usageResult.ok,
+        orders: ordersResult.ok,
+        users: usersResult.ok,
+        errors: [needsResult, analysisResult, eventsResult, feedbackResult, matchesResult, runsResult, usageResult, ordersResult, usersResult]
+          .filter((item) => !item.ok)
+          .map((item) => item.error)
+      }
+    });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
 }
 
 async function handleSiteEvent(req, res) {
@@ -5925,6 +6237,7 @@ createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/api/stripe/webhook") return handleStripeWebhook(req, res);
   if (req.method === "POST" && url.pathname === "/api/admin/products/sync-stripe") return handleAdminProductSync(req, res);
   if (req.method === "POST" && url.pathname === "/api/admin/products/resolve-alerts") return handleAdminProductResolveAlerts(req, res);
+  if (req.method === "GET" && url.pathname === "/api/admin/resolve/analytics") return handleAdminResolveAnalytics(req, res);
   if (req.method === "POST" && url.pathname.startsWith("/api/admin/needs/") && url.pathname.endsWith("/analyze")) {
     return handleAdminAnalyzeNeed(req, res, url.pathname.replace("/api/admin/needs/", "").replace("/analyze", ""));
   }
