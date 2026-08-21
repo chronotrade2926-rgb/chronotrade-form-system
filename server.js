@@ -2656,13 +2656,28 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
         metadata: { need_id: need.id, run_id: runId || null, usage_event_id: usageEventId || null }
       });
     } else {
-      await settleUsageReservation({
+      const settlement = await settleUsageReservation({
         reservationId: usageReservation.reservation.id,
         userId: need.user_id,
         usageEventId,
         chargedCredits: chargedUsageCredits,
         metadata: { need_id: need.id, run_id: runId || null, delivered: true }
       });
+      if (settlement?.ok && chargedUsageCredits > 0) {
+        await recordSiteEvent({
+          userId: need.user_id,
+          sessionId: need.session_id || null,
+          eventType: "credits_used",
+          entityType: "need",
+          entityId: need.id,
+          metadata: {
+            operation: "need_analysis",
+            charged_credits: chargedUsageCredits,
+            reservation_id: usageReservation.reservation.id,
+            usage_event_id: usageEventId || null
+          }
+        });
+      }
     }
   }
   if (matches.length) await recordNeedEvent(need.id, need.user_id, "ai_match_generated", { metadata: { bestScore, matches: matches.map((match) => ({ solution_id: match.solution_id, score: match.score })) } });
@@ -4634,6 +4649,11 @@ async function handleSiteEvent(req, res) {
       "home_viewed",
       "need_input_focused",
       "need_started",
+      "problem_started",
+      "problem_submitted",
+      "problem_understood",
+      "clarification_requested",
+      "free_plan_generated",
       "need_analysis_started",
       "need_analysis_completed",
       "need_analysis_failed",
@@ -4641,6 +4661,14 @@ async function handleSiteEvent(req, res) {
       "need_submitted",
       "analysis_corrected",
       "clarification_answered",
+      "free_value_feedback",
+      "signup_started",
+      "signup_completed",
+      "return_visit",
+      "second_problem",
+      "solution_viewed",
+      "topup_viewed",
+      "credits_used",
       "solution_proposed",
       "solution_accepted",
       "solution_rejected",
@@ -5525,6 +5553,21 @@ async function applyCreditPurchaseFromStripeSession(session, eventType = "") {
     }
   });
   if (result.enabled !== false && result.ok === false) throw new Error(result.message || "Credit wallet non enregistre.");
+  if (result.ok && !result.duplicate) {
+    await recordSiteEvent({
+      userId,
+      eventType: "purchase_completed",
+      entityType: "wallet",
+      entityId: result.data?.id || result.ledger?.id || null,
+      metadata: {
+        source: "stripe_credit_purchase",
+        eventType,
+        amount_cents: amountCents,
+        credits,
+        stripe_session_id: session.id
+      }
+    });
+  }
   return result;
 }
 
@@ -5562,6 +5605,21 @@ async function grantSubscriptionCredits(subscription, eventType = "", invoice = 
     }
   });
   if (result.enabled !== false && result.ok === false) throw new Error(result.message || "Allocation abonnement non enregistree.");
+  if (result.ok && !result.duplicate) {
+    await recordSiteEvent({
+      userId,
+      eventType: "purchase_completed",
+      entityType: "subscription",
+      entityId: result.data?.id || result.ledger?.id || subscription.id,
+      metadata: {
+        source: "stripe_subscription",
+        eventType,
+        subscription_id: subscription.id,
+        plan_code: plan?.code || metadata.plan_code || null,
+        credits
+      }
+    });
+  }
   return result;
 }
 
