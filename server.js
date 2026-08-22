@@ -14,6 +14,8 @@ const outboxPath = join(dataDir, "email-outbox.json");
 const followupsPath = join(dataDir, "followups.json");
 const ordersPath = join(dataDir, "orders.json");
 const productIntakesPath = join(dataDir, "product-intakes.json");
+const resolveNeedsPath = join(dataDir, "resolve-needs.json");
+const siteEventsPath = join(dataDir, "site-events.json");
 
 const PORT = Number(process.env.PORT || 3030);
 const PUBLIC_BASE_URL = cleanUrl(process.env.PUBLIC_BASE_URL || "");
@@ -38,6 +40,7 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 const CREDIT_MIN_PURCHASE_EUR = Number(process.env.CHRONOTRADE_CREDIT_MIN_PURCHASE_EUR || 10);
 const CREDITS_PER_EUR = Number(process.env.CHRONOTRADE_CREDITS_PER_EUR || 10);
 const FREE_MONTHLY_CREDITS = Number(process.env.CHRONOTRADE_FREE_MONTHLY_CREDITS || 100);
+const FREE_WEEKLY_DEEP_DIVES = Number(process.env.CHRONOTRADE_FREE_WEEKLY_DEEP_DIVES || 3);
 const WELCOME_CREDITS = Number(process.env.CHRONOTRADE_WELCOME_CREDITS || 100);
 const USAGE_GATE_ENFORCED = String(process.env.CHRONOTRADE_USAGE_GATE_ENFORCED || "").toLowerCase() === "true";
 const USAGE_GATE_NEED_ANALYSIS_CREDITS = Math.max(1, Number(process.env.CHRONOTRADE_USAGE_GATE_NEED_ANALYSIS_CREDITS || 1));
@@ -45,6 +48,21 @@ const RESOLVE_SESSION_LIMIT_PER_HOUR = Math.max(1, Number(process.env.CHRONOTRAD
 const RESOLVE_IP_LIMIT_PER_HOUR = Math.max(5, Number(process.env.CHRONOTRADE_RESOLVE_IP_LIMIT_PER_HOUR || 40));
 const AI_DAILY_COST_LIMIT_USD = Math.max(0, Number(process.env.CHRONOTRADE_AI_DAILY_COST_LIMIT_USD || 5));
 const AI_COST_GUARD_ENABLED = String(process.env.CHRONOTRADE_AI_COST_GUARD_ENABLED || "true").toLowerCase() !== "false";
+const AI_KILL_SWITCH = String(process.env.CHRONOTRADE_AI_KILL_SWITCH || "").toLowerCase() === "true";
+const AI_ESTIMATED_NEED_ANALYSIS_COST_USD = Math.max(0, Number(process.env.CHRONOTRADE_AI_ESTIMATED_NEED_ANALYSIS_COST_USD || 0.03));
+const AI_REQUEST_COST_LIMIT_USD = Math.max(0, Number(process.env.CHRONOTRADE_AI_REQUEST_COST_LIMIT_USD || 0.25));
+const AI_USER_HOURLY_COST_LIMIT_USD = Math.max(0, Number(process.env.CHRONOTRADE_AI_USER_HOURLY_COST_LIMIT_USD || 0.75));
+const AI_USER_DAILY_COST_LIMIT_USD = Math.max(0, Number(process.env.CHRONOTRADE_AI_USER_DAILY_COST_LIMIT_USD || 2));
+const AI_MONTHLY_COST_LIMIT_USD = Math.max(0, Number(process.env.CHRONOTRADE_AI_MONTHLY_COST_LIMIT_USD || 80));
+const AI_GLOBAL_COST_LIMIT_USD = Math.max(0, Number(process.env.CHRONOTRADE_AI_GLOBAL_COST_LIMIT_USD || 500));
+const AI_CIRCUIT_BREAKER_FAILURES = Math.max(1, Number(process.env.CHRONOTRADE_AI_CIRCUIT_BREAKER_FAILURES || 6));
+const NODE_ENV = String(process.env.NODE_ENV || "").toLowerCase();
+const IS_DEV_OR_TEST = ["test", "development", "dev", "local"].includes(NODE_ENV);
+const IS_PRODUCTION = !IS_DEV_OR_TEST && (["production", "prod"].includes(NODE_ENV) || Boolean(process.env.RENDER || process.env.RENDER_SERVICE_ID) || SITE_ORIGIN.includes("chronotradehub.com"));
+const ALLOW_LOCAL_JSON_FALLBACK = IS_DEV_OR_TEST || String(process.env.CHRONOTRADE_ALLOW_LOCAL_JSON_FALLBACK || "").toLowerCase() === "true";
+const PROFIT_GUARD_ENABLED = String(process.env.CHRONOTRADE_PROFIT_GUARD_ENABLED || "true").toLowerCase() !== "false";
+const PROFIT_GUARD_MIN_MARGIN_CENTS = Math.max(0, Number(process.env.CHRONOTRADE_PROFIT_GUARD_MIN_MARGIN_CENTS || 200));
+const PROFIT_GUARD_MIN_MARGIN_RATE = Math.max(0, Number(process.env.CHRONOTRADE_PROFIT_GUARD_MIN_MARGIN_RATE || 0.25));
 const SECURITY_LOG_SALT = process.env.CHRONOTRADE_SECURITY_LOG_SALT || process.env.ADMIN_API_KEY || process.env.STRIPE_WEBHOOK_SECRET || "chronotrade-v1";
 const DEFAULT_BILLING_PLANS = [
   { code: "essentiel", name: "Essentiel", price_cents: 2000, currency: "EUR", monthly_credits: 250, deep_dives: 5, features: ["Socle gratuit conserve", "Conversations sauvegardees", "Alertes", "Profil d'interaction"] },
@@ -69,6 +87,10 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || "";
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || "";
 let graphTokenCache = null;
+
+function canUseLocalJsonFallback() {
+  return ALLOW_LOCAL_JSON_FALLBACK && !SUPABASE_URL && !SUPABASE_SERVICE_ROLE_KEY;
+}
 
 const companyProfile = {
   name: "ChronoTrade",
@@ -1197,6 +1219,35 @@ async function addOutbox(items) {
   const outbox = await readJson(outboxPath, []);
   outbox.unshift(...items);
   await writeJson(outboxPath, outbox);
+}
+
+async function saveLocalResolveNeed(payload) {
+  const needs = await readJson(resolveNeedsPath, []);
+  const now = new Date().toISOString();
+  const need = {
+    ...payload,
+    id: randomUUID(),
+    status: payload.status || "NEW",
+    created_at: now,
+    updated_at: now,
+    storage_mode: "local_json_fallback"
+  };
+  needs.unshift(need);
+  await writeJson(resolveNeedsPath, needs.slice(0, 1000));
+  return need;
+}
+
+async function saveLocalSiteEvent(payload) {
+  const events = await readJson(siteEventsPath, []);
+  const event = {
+    id: randomUUID(),
+    ...payload,
+    created_at: new Date().toISOString(),
+    storage_mode: "local_json_fallback"
+  };
+  events.unshift(event);
+  await writeJson(siteEventsPath, events.slice(0, 2000));
+  return event;
 }
 
 async function addFollowupsForLead(lead) {
@@ -2351,35 +2402,97 @@ async function checkResolveRateLimit({ req, sessionId = "", userId = null } = {}
   return { allowed: true, ip };
 }
 
-async function aiCostGuardSnapshot() {
+function costGuardState(spent, limit) {
+  if (!limit) return { status: "disabled", ratio: 0 };
+  const ratio = spent / limit;
+  return {
+    status: ratio >= 1 ? "blocked" : ratio >= 0.95 ? "critical" : ratio >= 0.85 ? "warning" : ratio >= 0.7 ? "watch" : "ok",
+    ratio: Number(ratio.toFixed(4))
+  };
+}
+
+function sumEstimatedCost(rows) {
+  return rows.reduce((sum, row) => sum + Number(row.estimated_cost_usd || 0), 0);
+}
+
+async function aiCostGuardSnapshot({ userId = null, sessionId = "", estimatedRequestCostUsd = AI_ESTIMATED_NEED_ANALYSIS_COST_USD } = {}) {
+  if (AI_KILL_SWITCH) {
+    return { enabled: true, status: "blocked", reason: "kill_switch", kill_switch: true };
+  }
   if (!AI_COST_GUARD_ENABLED || !AI_DAILY_COST_LIMIT_USD) {
     return { enabled: false, status: "disabled", daily_limit_usd: AI_DAILY_COST_LIMIT_USD };
   }
   const start = new Date();
   start.setUTCHours(0, 0, 0, 0);
+  const hourStart = new Date(Date.now() - 60 * 60 * 1000);
+  const monthStart = new Date();
+  monthStart.setUTCDate(1);
+  monthStart.setUTCHours(0, 0, 0, 0);
   const result = await supabaseSelect("usage_events", {
-    select: "id,estimated_cost_usd,operation,provider,status,created_at",
-    created_at: `gte.${start.toISOString()}`,
+    select: "id,user_id,session_id,estimated_cost_usd,operation,provider,status,created_at",
+    created_at: `gte.${monthStart.toISOString()}`,
     order: "created_at.desc",
-    limit: "1000"
+    limit: "5000"
   });
   const rows = result.ok && Array.isArray(result.data) ? result.data : [];
-  const spent = rows.reduce((sum, row) => sum + Number(row.estimated_cost_usd || 0), 0);
-  const ratio = AI_DAILY_COST_LIMIT_USD > 0 ? spent / AI_DAILY_COST_LIMIT_USD : 0;
-  const status = ratio >= 1 ? "blocked" : ratio >= 0.95 ? "critical" : ratio >= 0.85 ? "warning" : ratio >= 0.7 ? "watch" : "ok";
+  const dayRows = rows.filter((row) => new Date(row.created_at).getTime() >= start.getTime());
+  const hourRows = rows.filter((row) => new Date(row.created_at).getTime() >= hourStart.getTime());
+  const userDayRows = userId ? dayRows.filter((row) => row.user_id === userId) : [];
+  const userHourRows = userId ? hourRows.filter((row) => row.user_id === userId) : [];
+  const recentFailures = hourRows.filter((row) => ["failed", "timeout", "error"].includes(String(row.status || "").toLowerCase())).length;
+  const spentToday = sumEstimatedCost(dayRows);
+  const spentMonth = sumEstimatedCost(rows);
+  const spentUserToday = sumEstimatedCost(userDayRows);
+  const spentUserHour = sumEstimatedCost(userHourRows);
+  const dailyState = costGuardState(spentToday, AI_DAILY_COST_LIMIT_USD);
+  const monthlyState = costGuardState(spentMonth, AI_MONTHLY_COST_LIMIT_USD);
+  const globalState = costGuardState(spentMonth, AI_GLOBAL_COST_LIMIT_USD);
+  const userDailyState = costGuardState(spentUserToday, userId ? AI_USER_DAILY_COST_LIMIT_USD : 0);
+  const userHourlyState = costGuardState(spentUserHour, userId ? AI_USER_HOURLY_COST_LIMIT_USD : 0);
+  const requestState = costGuardState(Number(estimatedRequestCostUsd || 0), AI_REQUEST_COST_LIMIT_USD);
+  const circuitBreakerState = recentFailures >= AI_CIRCUIT_BREAKER_FAILURES ? "blocked" : recentFailures >= Math.ceil(AI_CIRCUIT_BREAKER_FAILURES * 0.7) ? "warning" : "ok";
+  const states = [dailyState.status, monthlyState.status, globalState.status, userDailyState.status, userHourlyState.status, requestState.status, circuitBreakerState];
+  const status = states.includes("blocked") ? "blocked" : states.includes("critical") ? "critical" : states.includes("warning") ? "warning" : states.includes("watch") ? "watch" : "ok";
+  const blockedReason = requestState.status === "blocked" ? "request_cost_limit"
+    : userHourlyState.status === "blocked" ? "user_hourly_limit"
+      : userDailyState.status === "blocked" ? "user_daily_limit"
+        : dailyState.status === "blocked" ? "daily_limit"
+          : monthlyState.status === "blocked" ? "monthly_limit"
+            : globalState.status === "blocked" ? "global_limit"
+              : circuitBreakerState === "blocked" ? "circuit_breaker"
+                : "";
   return {
     enabled: true,
     status,
+    reason: blockedReason || null,
+    kill_switch: false,
     daily_limit_usd: AI_DAILY_COST_LIMIT_USD,
-    spent_today_usd: Number(spent.toFixed(6)),
-    ratio: Number(ratio.toFixed(4)),
-    events_today: rows.length,
+    monthly_limit_usd: AI_MONTHLY_COST_LIMIT_USD,
+    global_limit_usd: AI_GLOBAL_COST_LIMIT_USD,
+    request_limit_usd: AI_REQUEST_COST_LIMIT_USD,
+    user_hourly_limit_usd: AI_USER_HOURLY_COST_LIMIT_USD,
+    user_daily_limit_usd: AI_USER_DAILY_COST_LIMIT_USD,
+    estimated_request_cost_usd: Number(Number(estimatedRequestCostUsd || 0).toFixed(6)),
+    spent_today_usd: Number(spentToday.toFixed(6)),
+    spent_month_usd: Number(spentMonth.toFixed(6)),
+    spent_user_hour_usd: Number(spentUserHour.toFixed(6)),
+    spent_user_today_usd: Number(spentUserToday.toFixed(6)),
+    ratio: dailyState.ratio,
+    monthly_ratio: monthlyState.ratio,
+    global_ratio: globalState.ratio,
+    user_hourly_ratio: userHourlyState.ratio,
+    user_daily_ratio: userDailyState.ratio,
+    request_ratio: requestState.ratio,
+    recent_failures: recentFailures,
+    circuit_breaker_failures: AI_CIRCUIT_BREAKER_FAILURES,
+    events_today: dayRows.length,
+    events_month: rows.length,
     storage: result.ok ? { ok: true } : { ok: false, error: result.message }
   };
 }
 
 async function checkCostGuardBeforeAi({ needId = null, userId = null, sessionId = "", operation = "need_analysis" } = {}) {
-  const snapshot = await aiCostGuardSnapshot();
+  const snapshot = await aiCostGuardSnapshot({ userId, sessionId, estimatedRequestCostUsd: AI_ESTIMATED_NEED_ANALYSIS_COST_USD });
   if (!snapshot.enabled || snapshot.status !== "blocked") return { allowed: true, snapshot };
   await recordSecurityEvent({
     eventType: "ai_cost_guard_blocked",
@@ -2387,13 +2500,13 @@ async function checkCostGuardBeforeAi({ needId = null, userId = null, sessionId 
     userId,
     sessionId,
     path: "/api/resolve/needs",
-    reason: "daily_ai_budget_reached",
+    reason: snapshot.reason || "ai_budget_guard_blocked",
     metadata: { need_id: needId, operation, cost_guard: snapshot }
   });
   return {
     allowed: false,
     code: "cost_guard_blocked",
-    error: "Le budget IA journalier ChronoTrade est atteint. Le besoin est conserve et une reponse gratuite de secours est fournie.",
+    error: "Le budget IA ChronoTrade est temporairement limite. Le besoin est conserve et une reponse gratuite de secours est fournie.",
     snapshot
   };
 }
@@ -2822,6 +2935,43 @@ function productAmountCents(product) {
   return Number.isFinite(Number(amount)) ? Number(amount) : null;
 }
 
+function productEstimatedCostCents(product = {}, plan = null) {
+  const productMetadata = product?.metadata && typeof product.metadata === "object" ? product.metadata : {};
+  const planMetadata = plan?.metadata && typeof plan.metadata === "object" ? plan.metadata : {};
+  const candidates = [
+    plan?.estimated_cost_cents,
+    planMetadata.estimated_cost_cents,
+    planMetadata.cost_cents,
+    product?.estimated_cost_cents,
+    productMetadata.estimated_cost_cents,
+    productMetadata.cost_cents,
+    product?.commerce_config?.estimated_cost_cents,
+    product?.commerce_config?.cost_cents
+  ];
+  const value = candidates.map(Number).find((amount) => Number.isFinite(amount) && amount > 0);
+  return value ? Math.round(value) : 0;
+}
+
+function validateProfitGuard({ product = {}, plan = null, priceCents = null } = {}) {
+  if (!PROFIT_GUARD_ENABLED) return { ok: true, skipped: true, reason: "disabled" };
+  const amount = Number(priceCents ?? productAmountCents(plan || product));
+  const estimatedCost = productEstimatedCostCents(product, plan);
+  if (!estimatedCost || !Number.isFinite(amount)) return { ok: true, estimated_cost_cents: estimatedCost, price_cents: amount || 0 };
+  const margin = Math.max(PROFIT_GUARD_MIN_MARGIN_CENTS, Math.ceil(estimatedCost * PROFIT_GUARD_MIN_MARGIN_RATE));
+  const minimumPrice = estimatedCost + margin;
+  if (amount < minimumPrice) {
+    return {
+      ok: false,
+      price_cents: amount,
+      estimated_cost_cents: estimatedCost,
+      safety_margin_cents: margin,
+      minimum_price_cents: minimumPrice,
+      error: `Prix insuffisant : ${formatMoneyCents(amount)} < cout previsionnel + marge (${formatMoneyCents(minimumPrice)}).`
+    };
+  }
+  return { ok: true, price_cents: amount, estimated_cost_cents: estimatedCost, safety_margin_cents: margin, minimum_price_cents: minimumPrice };
+}
+
 function unixToIso(value) {
   return value ? new Date(Number(value) * 1000).toISOString() : null;
 }
@@ -2984,6 +3134,8 @@ async function ensureWelcomeCredits(userId) {
     externalReference: `welcome:${userId}:v1`,
     metadata: {
       source: "account_bootstrap",
+      credit_bucket: "promotional",
+      credit_origin: "welcome_bonus",
       label: `Bonus de bienvenue ChronoTrade - ${WELCOME_CREDITS} credits`,
       promotional: true,
       idempotent: true
@@ -3269,6 +3421,8 @@ async function syncProductWithStripe(product, reason = "manual_sync") {
   }
   if (product.status === "archived") throw new Error("Produit archive : achat impossible.");
   const amount = productAmountCents(product);
+  const profitGuard = validateProfitGuard({ product, priceCents: amount });
+  if (!profitGuard.ok) throw new Error(profitGuard.error);
   const currency = String(product.currency || "EUR").toLowerCase();
   let stripeProductId = product.stripe_product_id || "";
   try {
@@ -3391,6 +3545,8 @@ async function syncPlanWithStripe(product, plan, reason = "plan_sync") {
   const productSync = await syncProductWithStripe({ ...product, price_cents: product.price_cents || plan.price_cents }, `${reason}_product`);
   const stripeProductId = productSync.product.stripe_product_id;
   const amount = productAmountCents(plan);
+  const profitGuard = validateProfitGuard({ product, plan, priceCents: amount });
+  if (!profitGuard.ok) throw new Error(profitGuard.error);
   const currency = String(plan.currency || product.currency || "EUR").toLowerCase();
   const priceMatches = plan.stripe_price_id
     && Number(plan.stripe_price_amount || plan.price_cents) === amount
@@ -4025,6 +4181,48 @@ async function handleResolveNeed(req, res) {
       }
     };
     const inserted = await supabaseInsert("needs", payload);
+    if (!inserted.ok && canUseLocalJsonFallback()) {
+      const localNeed = await saveLocalResolveNeed(payload);
+      const analysis = boostAnalysisWithBusinessSignals(fallbackNeedAnalysis(localNeed, serverRisk), localNeed);
+      const reasoningState = buildPublicReasoningState({
+        need: localNeed,
+        analysis,
+        matches: [],
+        status: serverRisk?.status || "UNRESOLVED"
+      });
+      return jsonResponse(res, 201, {
+        ok: true,
+        need: { id: localNeed.id, status: serverRisk?.status || "UNRESOLVED", ref: `LOCAL-${String(localNeed.id).slice(0, 8).toUpperCase()}` },
+        understood: {
+          summary: analysis.summary || null,
+          primaryProblem: analysis.primary_problem || null,
+          desiredOutcome: analysis.desired_outcome || null,
+          category: analysis.category || payload.detected_category || null,
+          confidence: analysis.confidence_score ?? null
+        },
+        nextAction: analysis.desired_outcome || analysis.user_facing_suggestion || reasoningState.next_action || null,
+        suggestion: analysis.user_facing_suggestion || null,
+        questions: reasoningState.selected_question ? [reasoningState.selected_question] : [],
+        narrative_state: reasoningState,
+        reasoning_state: reasoningState,
+        question_selector: {
+          selected_question: reasoningState.selected_question,
+          reason: reasoningState.selected_question_reason,
+          should_ask: Boolean(reasoningState.selected_question),
+          next_recommended_step: reasoningState.next_action,
+          asks_one_question_by_default: true
+        },
+        similarCount: 0,
+        matches: [],
+        noCurrentSolution: true,
+        integrations: {
+          supabase: { ...inserted, fallback: "local_json", localPath: "data/resolve-needs.json" },
+          notification: { enabled: false, skipped: true, reason: "local_json_fallback" },
+          clientEmail: { enabled: false, skipped: true, reason: "local_json_fallback" },
+          ai: { ok: false, status: "fallback_no_supabase" }
+        }
+      });
+    }
     if (!inserted.ok) return jsonResponse(res, 500, { ok: false, error: inserted.message, integrations: { supabase: inserted } });
     const need = Array.isArray(inserted.data) ? inserted.data[0] : inserted.data;
     if (need?.id) {
@@ -4645,7 +4843,18 @@ async function handleSiteEvent(req, res) {
   try {
     const body = await readRequestBody(req);
     const authUser = await supabaseAuthUser(req);
+    const eventAliases = {
+      home_viewed: "landing_view",
+      page_view: "landing_view",
+      need_input_focused: "problem_started",
+      need_started: "problem_started",
+      need_submitted: "problem_submitted",
+      free_value_feedback: "feedback_positive",
+      problem_resolved: "resolved",
+      no_solution_found: "unresolved"
+    };
     const allowed = new Set([
+      "landing_view",
       "home_viewed",
       "need_input_focused",
       "need_started",
@@ -4654,6 +4863,9 @@ async function handleSiteEvent(req, res) {
       "problem_understood",
       "clarification_requested",
       "free_plan_generated",
+      "free_plan_viewed",
+      "feedback_positive",
+      "feedback_negative",
       "need_analysis_started",
       "need_analysis_completed",
       "need_analysis_failed",
@@ -4669,6 +4881,10 @@ async function handleSiteEvent(req, res) {
       "solution_viewed",
       "topup_viewed",
       "credits_used",
+      "repeat_purchase",
+      "resolved",
+      "partially_resolved",
+      "unresolved",
       "solution_proposed",
       "solution_accepted",
       "solution_rejected",
@@ -4695,8 +4911,11 @@ async function handleSiteEvent(req, res) {
       "beta_joined",
       "update_viewed"
     ]);
-    const eventType = cleanString(body.event_type || body.eventType);
-    if (!allowed.has(eventType)) return jsonResponse(res, 422, { ok: false, error: "Evenement non autorise." });
+    const rawEventType = cleanString(body.event_type || body.eventType);
+    const eventType = eventAliases[rawEventType] || rawEventType;
+    if (!allowed.has(rawEventType) && !allowed.has(eventType)) return jsonResponse(res, 422, { ok: false, error: "Evenement non autorise." });
+    const metadata = body.metadata && typeof body.metadata === "object" ? { ...body.metadata } : {};
+    if (rawEventType !== eventType) metadata.original_event_type = rawEventType;
     const event = await recordSiteEvent({
       userId: authUser?.id || null,
       sessionId: cleanString(body.session_id) || null,
@@ -4705,8 +4924,21 @@ async function handleSiteEvent(req, res) {
       entityId: cleanString(body.entity_id || body.entityId) || null,
       path: cleanString(body.path) || null,
       referrer: cleanString(body.referrer) || null,
-      metadata: body.metadata && typeof body.metadata === "object" ? body.metadata : {}
+      metadata
     });
+    if (!event.ok && canUseLocalJsonFallback()) {
+      const localEvent = await saveLocalSiteEvent({
+        user_id: authUser?.id || null,
+        session_id: cleanString(body.session_id) || null,
+        event_type: eventType,
+        entity_type: cleanString(body.entity_type || body.entityType) || null,
+        entity_id: cleanString(body.entity_id || body.entityId) || null,
+        path: cleanString(body.path) || null,
+        referrer: cleanString(body.referrer) || null,
+        metadata
+      });
+      return jsonResponse(res, 201, { ok: true, event: localEvent, integrations: { supabase: { ...event, fallback: "local_json", localPath: "data/site-events.json" } } });
+    }
     return jsonResponse(res, event.ok ? 201 : 500, { ok: Boolean(event.ok), error: event.ok ? null : event.message });
   } catch (error) {
     return jsonResponse(res, 500, { ok: false, error: error.message });
@@ -5546,6 +5778,8 @@ async function applyCreditPurchaseFromStripeSession(session, eventType = "") {
     stripeSessionId: session.id,
     metadata: {
       source: "stripe_checkout",
+      credit_bucket: "purchased",
+      credit_origin: "stripe_credit_purchase",
       eventType,
       label: `Achat de ${credits} credits`,
       creditsPerEur: Number(metadata.credits_per_eur || CREDITS_PER_EUR),
@@ -5596,6 +5830,8 @@ async function grantSubscriptionCredits(subscription, eventType = "", invoice = 
     stripeInvoiceId: invoiceId,
     metadata: {
       source: "stripe_subscription",
+      credit_bucket: "subscription",
+      credit_origin: "subscription_allowance",
       eventType,
       subscriptionId: subscription.id,
       planCode: plan?.code || metadata.plan_code || null,
@@ -5962,6 +6198,7 @@ async function handleWalletSummary(req, res) {
       wallet: {
         balance_credits: balance,
         free_monthly_credits: FREE_MONTHLY_CREDITS,
+        free_weekly_deep_dives: FREE_WEEKLY_DEEP_DIVES,
         welcome_credits: WELCOME_CREDITS,
         credits_per_eur: CREDITS_PER_EUR,
         min_purchase_eur: CREDIT_MIN_PURCHASE_EUR
@@ -5992,6 +6229,8 @@ async function handleWalletSummary(req, res) {
         amount_cents: row.amount_cents,
         currency: row.currency || "EUR",
         status: row.status || "posted",
+        credit_bucket: row.metadata?.credit_bucket || null,
+        credit_origin: row.metadata?.credit_origin || row.metadata?.source || null,
         created_at: row.created_at,
         label: row.metadata?.label || row.metadata?.planName || row.metadata?.source || row.entry_type
       })),
@@ -6498,6 +6737,8 @@ async function ensureDataFiles() {
   if (!existsSync(followupsPath)) await writeJson(followupsPath, []);
   if (!existsSync(ordersPath)) await writeJson(ordersPath, []);
   if (!existsSync(productIntakesPath)) await writeJson(productIntakesPath, []);
+  if (!existsSync(resolveNeedsPath)) await writeJson(resolveNeedsPath, []);
+  if (!existsSync(siteEventsPath)) await writeJson(siteEventsPath, []);
 }
 
 await ensureDataFiles();
