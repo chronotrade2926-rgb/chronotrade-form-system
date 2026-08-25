@@ -4,7 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test:problem-engine": "node tests/problem-engine-local-check.mjs",
+    "test:architecture": "node tests/internal-architecture-check.mjs",
+    "test:cost-guard": "node tests/cost-guard-simulation-check.mjs",
+    "test:internal": "node --check server.js && node tests/internal-architecture-check.mjs && node tests/cost-guard-simulation-check.mjs && node tests/problem-engine-local-check.mjs"
   },
   "engines": {
     "node": ">=18"

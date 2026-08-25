@@ -65,13 +65,13 @@ const PROFIT_GUARD_MIN_MARGIN_CENTS = Math.max(0, Number(process.env.CHRONOTRADE
 const PROFIT_GUARD_MIN_MARGIN_RATE = Math.max(0, Number(process.env.CHRONOTRADE_PROFIT_GUARD_MIN_MARGIN_RATE || 0.25));
 const SECURITY_LOG_SALT = process.env.CHRONOTRADE_SECURITY_LOG_SALT || process.env.ADMIN_API_KEY || process.env.STRIPE_WEBHOOK_SECRET || "chronotrade-v1";
 const DEFAULT_BILLING_PLANS = [
-  { code: "essentiel", name: "Essentiel", price_cents: 2000, currency: "EUR", monthly_credits: 250, deep_dives: 5, features: ["Socle gratuit conserve", "Conversations sauvegardees", "Alertes", "Profil d'interaction"] },
-  { code: "pro", name: "Pro", price_cents: 5000, currency: "EUR", monthly_credits: 700, deep_dives: 12, features: ["Tout Essentiel", "Limites d'analyse superieures", "Personnalisation avancee", "Memoire plus longue selon disponibilite"] },
-  { code: "max", name: "Max", price_cents: 10000, currency: "EUR", monthly_credits: 1600, deep_dives: 30, features: ["Tout Pro", "Limites superieures", "Budgets d'analyse plus eleves", "Personnalisation maximale disponible"] }
+  { code: "essentiel", name: "Essentiel", price_cents: 2000, currency: "EUR", monthly_credits: 250, deep_dives: 5, features: ["250 credits mensuels", "5 approfondissements inclus", "Quota gratuit conserve", "Historique et alertes sauvegardes"] },
+  { code: "pro", name: "Pro", price_cents: 5000, currency: "EUR", monthly_credits: 700, deep_dives: 12, features: ["700 credits mensuels", "12 approfondissements inclus", "Priorite sur les analyses longues", "Meilleur equilibre usage / budget"] },
+  { code: "max", name: "Max", price_cents: 10000, currency: "EUR", monthly_credits: 1600, deep_dives: 30, features: ["1600 credits mensuels", "30 approfondissements inclus", "Usage intensif et suivi avance", "Parametres recalibrables selon les couts reels"] }
 ];
 const SUPER_ADMIN_EMAILS = new Set(
   (process.env.CHRONOTRADE_SUPER_ADMIN_EMAILS ||
-    "bouchonneflorent@gmail.com")
+    "bouchonnetflorent@gmail.com")
     .split(",")
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean)
@@ -1490,7 +1490,7 @@ async function supabaseUpdate(table, payload, filters = {}, options = {}) {
 }
 
 async function supabaseProductBySlugOrId({ slug, productId, stripePriceId }) {
-  const select = "id,title,slug,short_description,description,product_type,delivery_type,price_cents,currency,stripe_product_id,stripe_price_id,stripe_price_amount,stripe_price_currency,stripe_price_active,stripe_last_sync_at,stripe_sync_error,pricing_model,availability,lifecycle_status,cta_mode,provider_type,status,checkout_url,form_url,current_version,delivery_config,email_config,commerce_config,presentation_config,social_proof_config,metadata";
+  const select = "id,title,slug,short_description,description,product_type,delivery_type,price_cents,currency,stripe_product_id,stripe_price_id,stripe_price_amount,stripe_price_currency,stripe_price_active,stripe_last_sync_at,stripe_sync_error,pricing_model,billing_model,credit_cost,compatible_subscription_codes,problem_solved,solution_keywords,target_profile,solution_instructions,access_rights,availability,lifecycle_status,cta_mode,provider_type,status,checkout_url,form_url,current_version,delivery_config,email_config,commerce_config,presentation_config,social_proof_config,metadata";
   if (productId) {
     const result = await supabaseSelect("products", { select, id: `eq.${productId}`, limit: "1" });
     return result.ok && Array.isArray(result.data) ? result.data[0] || null : null;
@@ -1509,7 +1509,7 @@ async function supabaseProductBySlugOrId({ slug, productId, stripePriceId }) {
 async function supabaseProductPlan({ planId, productId, slug }) {
   if (!planId && !slug) return null;
   const params = {
-    select: "id,product_id,name,slug,pricing_model,price_cents,currency,interval,interval_count,trial_days,stripe_price_id,stripe_price_amount,stripe_price_currency,stripe_price_active,status,metadata"
+    select: "id,product_id,name,slug,pricing_model,billing_model,credit_cost,access_rights,price_cents,currency,interval,interval_count,trial_days,stripe_price_id,stripe_price_amount,stripe_price_currency,stripe_price_active,status,metadata"
   };
   if (planId) params.id = `eq.${planId}`;
   if (slug) params.slug = `eq.${slug}`;
@@ -1636,6 +1636,10 @@ async function callNeedAnalysisModel({ need, prompt }) {
               "Tu ne dois pas inventer de produit, service ou partenaire comme disponible.",
               "Si le besoin manque d'informations, propose une seule question prioritaire par defaut, uniquement si sa reponse peut changer la prochaine action. Tu peux proposer jusqu'a 3 questions seulement si elles sont vraiment critiques.",
               "Adapte le niveau de langage au profil d'interaction fourni sans changer le fond logique.",
+              "Contextualise toujours l'analyse par rapport au probleme exact, aux precisions deja donnees, aux actions deja proposees et aux retours utilisateur.",
+              "Le plan gratuit doit etre specifique au cas ecrit : utilise les montants, contraintes, objectifs, echecs precedents et faits explicites quand ils existent.",
+              "Ne donne jamais une reponse pre-faite. Si une precision ajoutee change le diagnostic, le plan doit devenir plus precis et expliquer ce qui change.",
+              "Distingue faits explicites, hypotheses et inconnus. N'affirme pas une cause que l'utilisateur n'a pas donnee.",
               "Retourne uniquement l'objet JSON conforme au schema."
             ].join("\n")
           },
@@ -1924,10 +1928,194 @@ function selectedQuestionForNeed(analysis = {}, hypotheses = [], matches = []) {
   };
 }
 
+function uniquePlanSteps(steps = []) {
+  const seen = new Set();
+  return steps
+    .map(cleanString)
+    .filter(Boolean)
+    .filter((step) => {
+      const key = normalizeForScoring(step).slice(0, 90);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 6);
+}
+
+function euroAmountsFromText(text = "") {
+  const values = [];
+  const source = String(text || "");
+  const regex = /(\d[\d\s.,]{0,10})\s*(?:e|eur|euro|euros|€)/gi;
+  let match = regex.exec(source);
+  while (match) {
+    const value = Number(String(match[1] || "").replace(/\s/g, "").replace(",", "."));
+    if (Number.isFinite(value) && value > 0) values.push(value);
+    match = regex.exec(source);
+  }
+  return values;
+}
+
+function contextualFreePlan(analysis = {}, need = {}) {
+  const raw = cleanString(need.raw_text);
+  if (isPromptHelpText(raw)) {
+    return ["Ecrivez une phrase brute, meme mal formulee : ce qui vous bloque, ce qui revient souvent ou ce que vous aimeriez ameliorer.", "Ajoutez un exemple concret si vous en avez un : une situation recente, une tache penible, un objectif ou une frustration.", "Indiquez ce que vous voudriez obtenir a la place : gagner du temps, comprendre quoi faire, trouver des clients, mieux vous organiser.", "Envoyez cette version simple. ChronoTrade pourra ensuite poser une seule precision utile si elle change vraiment la prochaine action."];
+  }
+  const text = normalizeForScoring([
+    raw,
+    analysis.summary,
+    analysis.primary_problem,
+    analysis.desired_outcome,
+    analysis.category,
+    ...(analysis.solution_tags || [])
+  ].join(" "));
+  const steps = [];
+  const add = (step) => steps.push(step);
+  const has = (...words) => words.some((word) => text.includes(normalizeForScoring(word)));
+  const amounts = euroAmountsFromText(raw);
+
+  if (amounts.length >= 2 && has("depense", "econom", "budget", "charges", "salaire", "revenu", "tabac", "abonnement", "sortie", "etf")) {
+    const income = amounts[0];
+    const knownExpenses = amounts.slice(1).reduce((sum, value) => sum + value, 0);
+    const remainder = Math.max(0, income - knownExpenses);
+    add(`D'apres les montants donnes, vous avez environ ${income} euros de revenus et ${knownExpenses} euros deja identifies. Il reste donc environ ${remainder} euros a expliquer avant de couper au hasard.`);
+    add("Classez chaque ligne en 3 colonnes : indispensable, utile mais ajustable, confort/plaisir.");
+    add("Traitez d'abord les postes ajustables recurrents, car ils se repetent tous les mois et donnent un effet durable.");
+    if (has("400")) add("Pour viser 400 euros d'epargne, calculez l'ecart exact entre votre reste actuel et ces 400 euros, puis choisissez 2 postes maximum a reduire.");
+    add("Gardez une petite marge plaisir realiste : un plan trop brutal tient rarement plus de deux semaines.");
+    return uniquePlanSteps(steps);
+  }
+
+  if (has("cv", "candidature", "candidatures", "entretien", "emploi", "poste", "recruteur")) {
+    add("Notez le poste exact vise, le nombre de candidatures envoyees et le nombre de retours obtenus.");
+    add("Prenez 3 annonces recentes et verifiez si les mots importants apparaissent clairement dans votre CV.");
+    add("Separez le diagnostic : ciblage des offres, CV, message d'accompagnement, volume, relance.");
+    add("Modifiez une seule variable sur les 10 prochaines candidatures pour savoir ce qui change vraiment.");
+    if (has("personne repond", "aucun retour")) add("Si aucun recruteur ne repond, commencez par tester un CV plus cible avant de refaire tout votre parcours.");
+    return uniquePlanSteps(steps);
+  }
+
+  if (has("client", "clients", "prospect", "vente", "conversion", "activite", "visibilite")) {
+    add("Ecrivez votre offre en une phrase simple : pour qui, quel probleme, quel resultat concret.");
+    add("Identifiez le blocage le plus probable parmi : cible, promesse, preuve, canal, prix, relance.");
+    add("Regardez les 5 derniers prospects ou visiteurs : a quelle etape exacte disparaissent-ils ?");
+    add("Choisissez un seul test cette semaine, par exemple refaire l'accroche, ajouter une preuve ou relancer proprement.");
+    if (has("prix", "cher", "trop cher")) add("Si le prix bloque, ne baissez pas tout de suite : verifiez d'abord si la valeur et les preuves sont assez visibles.");
+    return uniquePlanSteps(steps);
+  }
+
+  if (has("automatisation", "automatiser", "temps", "relance", "mail", "email", "devis", "workflow")) {
+    add("Listez les taches qui reviennent chaque semaine, puis gardez uniquement celles qui se repetent au moins 3 fois.");
+    add("Pour chaque tache, notez l'entree, l'action manuelle et la sortie attendue.");
+    add("Choisissez la tache la plus simple et la plus frequente comme premier test, pas la plus impressionnante.");
+    add("Gardez une validation humaine au debut pour eviter qu'une automatisation envoie une mauvaise information.");
+    return uniquePlanSteps(steps);
+  }
+
+  if (has("site", "landing", "web", "logo", "marque", "branding", "image", "identite")) {
+    add("Definissez ce que le visiteur doit comprendre en 5 secondes : activite, cible, resultat, prochaine action.");
+    add("Retirez ou deplacez tout ce qui ne sert pas cette comprehension immediate.");
+    add("Ajoutez 3 preuves de confiance : exemple, avis, resultat, process, avant/apres ou realisation.");
+    add("Testez la page avec une personne qui ne vous connait pas : elle doit pouvoir reformuler votre offre sans aide.");
+    return uniquePlanSteps(steps);
+  }
+
+  if (has("couple", "relation", "dispute", "conjoint", "copine", "copain", "collegue", "client mecontent")) {
+    add("Ecrivez un fait observable, sans jugement ni interpretation.");
+    add("Ajoutez ce que vous ressentez et ce que vous voulez eviter.");
+    add("Formulez une demande courte, concrete et verifiable.");
+    add("Si la situation implique danger, emprise ou violence, cherchez un soutien humain qualifie avant toute confrontation.");
+    return uniquePlanSteps(steps);
+  }
+
+  if (has("mental", "stress", "sante", "fatigue", "motivation", "sport", "habitude")) {
+    add("Choisissez une action tellement petite qu'elle est faisable aujourd'hui, meme avec peu d'energie.");
+    add("Notez votre etat avant et apres pour verifier si l'action aide vraiment.");
+    add("Repetez seulement 3 jours avant d'augmenter la difficulte.");
+    add("Si le probleme est intense, durable ou dangereux, parlez-en a un proche ou a un professionnel qualifie.");
+    return uniquePlanSteps(steps);
+  }
+
+  if (has("choix", "choisir", "decision", "hesite", "prioriser")) {
+    add("Listez les options reelles, puis supprimez celles qui ne sont pas faisables maintenant.");
+    add("Choisissez 3 criteres : impact, risque, cout, temps ou reversibilite.");
+    add("Identifiez l'option la plus reversible et testez-la en premier.");
+    add("Fixez une date de decision pour eviter de rester bloque dans la comparaison.");
+    return uniquePlanSteps(steps);
+  }
+
+  if (has("papier", "papiers", "administratif", "dossier", "facture", "document")) {
+    add("Regroupez tout au meme endroit avant de chercher une solution.");
+    add("Classez en trois piles : urgent, a traiter, archive.");
+    add("Choisissez le dossier qui bloque une consequence concrete : paiement, delai, obligation ou stress.");
+    add("Faites une seule action courte : envoyer, scanner, relancer ou demander la piece manquante.");
+    return uniquePlanSteps(steps);
+  }
+
+  if (has("apprendre", "formation", "cours", "etude", "etudier", "competence")) {
+    add("Definissez la competence exacte a obtenir, pas seulement le theme general.");
+    add("Faites un exercice test pour mesurer votre niveau actuel.");
+    add("Planifiez 3 sessions courtes cette semaine avec un resultat visible a produire.");
+    add("Mesurez ce que vous savez faire, pas seulement le temps passe.");
+    return uniquePlanSteps(steps);
+  }
+
+  const suggestion = cleanString(analysis.user_facing_suggestion);
+  if (suggestion && suggestion.length > 30 && !/clarifiez votre objectif|reformulez votre probleme/i.test(suggestion)) {
+    add(suggestion);
+  }
+  add("Reformulez le probleme en une phrase avec le resultat attendu.");
+  add("Ajoutez la contrainte principale : temps, argent, energie, outil, personne ou delai.");
+  add("Choisissez une action testable en moins de 48 heures.");
+  return uniquePlanSteps(steps);
+}
+
+function adaptStepToInteractionProfile(step = "", profile = {}, index = 0) {
+  const clean = cleanString(step);
+  if (!clean) return "";
+  const segment = profile.segment || "balanced";
+  if (segment === "novice_control") {
+    if (index === 0 && !/^Commencez par|^D'abord|^Avant/.test(clean)) {
+      return `Commencez par ${clean.charAt(0).toLowerCase()}${clean.slice(1)}`;
+    }
+    return clean.length > 180 ? `${clean.slice(0, 177).trim()}...` : clean;
+  }
+  if (segment === "experienced") {
+    return clean
+      .replace(/^Commencez par /i, "")
+      .replace(/^Avant de /i, "Avant de ")
+      .replace(/Cette base permet de /i, "")
+      .slice(0, 220);
+  }
+  return clean;
+}
+
+function refinePlanWithConversationMemory(steps = [], need = {}, profile = {}) {
+  const metadata = need.metadata && typeof need.metadata === "object" ? need.metadata : {};
+  const priorState = metadata.narrative_state || metadata.reasoning_state || {};
+  const tested = arrayOfCleanStrings([
+    ...(Array.isArray(priorState.actions_tested) ? priorState.actions_tested : []),
+    ...(Array.isArray(priorState.actions_already_tried) ? priorState.actions_already_tried : [])
+  ], 6);
+  const feedback = metadata.latest_feedback || priorState.result_feedback || null;
+  const refined = [...steps];
+  const negativeFeedback = feedback && ["no", "unresolved", "negative", "not_useful"].some((word) => normalizeForScoring(JSON.stringify(feedback)).includes(word));
+  if ((tested.length || negativeFeedback) && refined.length) {
+    refined[0] = tested.length
+      ? `Ne repartez pas sur ce qui a deja ete teste (${tested.slice(0, 2).join(", ")}). Utilisez plutot ce retour pour ajuster la prochaine action.`
+      : "Comme le dernier retour n'etait pas totalement utile, changez un seul parametre avant de retester.";
+  }
+  return uniquePlanSteps(refined)
+    .map((step, index) => adaptStepToInteractionProfile(step, profile, index))
+    .filter(Boolean);
+}
+
 function publicFreePlan(analysis = {}, matches = [], need = {}) {
+  const profile = interactionProfileFromNeed(need);
+  const contextual = refinePlanWithConversationMemory(contextualFreePlan(analysis, need), need, profile);
+  if (contextual.length) return contextual;
   const text = normalizeForScoring([need.raw_text, analysis.summary, analysis.primary_problem, analysis.desired_outcome, analysis.category, ...(analysis.solution_tags || [])].join(" "));
   if (isPromptHelpText(need.raw_text)) {
-    return ["Ecrivez une phrase brute, meme mal formulee : ce qui vous bloque, ce qui revient souvent ou ce que vous aimeriez ameliorer.", "Ajoutez un exemple concret si vous en avez un : une situation recente, une tache penible, un objectif ou une frustration.", "Indiquez ce que vous voudriez obtenir a la place : gagner du temps, comprendre quoi faire, trouver des clients, mieux vous organiser.", "Envoyez cette version simple. ChronoTrade pourra ensuite poser une seule precision utile si elle change vraiment la prochaine action."];
+    return refinePlanWithConversationMemory(["Ecrivez une phrase brute, meme mal formulee : ce qui vous bloque, ce qui revient souvent ou ce que vous aimeriez ameliorer.", "Ajoutez un exemple concret si vous en avez un : une situation recente, une tache penible, un objectif ou une frustration.", "Indiquez ce que vous voudriez obtenir a la place : gagner du temps, comprendre quoi faire, trouver des clients, mieux vous organiser.", "Envoyez cette version simple. ChronoTrade pourra ensuite poser une seule precision utile si elle change vraiment la prochaine action."], need, profile);
   }
   if (["cv", "candidature", "candidatures", "entretien", "emploi", "poste", "recruteur"].some((word) => text.includes(word))) {
     return ["Noter le poste exact vise et le nombre de candidatures envoyees.", "Comparer le CV et le message avec trois annonces ciblees.", "Identifier si le blocage vient du ciblage, du CV, du message ou du suivi.", "Modifier un seul element et mesurer les retours sur les 10 prochaines candidatures."];
@@ -2033,10 +2221,14 @@ function solutionSearchText(solution) {
     solution.description,
     solution.type,
     solution.price_model,
+    solution.billing_model,
+    solution.target_profile,
+    solution.solution_instructions,
     solution.internal_or_external,
     ...(solution.problems_solved || []),
     ...(solution.target_users || []),
     ...(solution.industries || []),
+    ...(solution.solution_keywords || []),
     ...(solution.metadata?.tags || []),
     ...(solution.metadata?.intents || [])
   ].join(" "));
@@ -2046,24 +2238,29 @@ function scoreSolutionMatch(solution, analysis, need) {
   const haystack = solutionSearchText(solution);
   const tags = arrayOfCleanStrings(analysis.solution_tags, 16);
   let score = 0;
-  for (const tag of tags) if (haystack.includes(normalizeForScoring(tag))) score += 0.24;
-  if (analysis.category && haystack.includes(normalizeForScoring(analysis.category))) score += 0.18;
-  if (analysis.subcategory && haystack.includes(normalizeForScoring(analysis.subcategory))) score += 0.16;
+  let strongSignals = 0;
+  const tagHits = tags.filter((tag) => haystack.includes(normalizeForScoring(tag))).slice(0, 4).length;
+  score += Math.min(0.48, tagHits * 0.24);
+  strongSignals += Math.min(2, tagHits);
+  if (analysis.category && haystack.includes(normalizeForScoring(analysis.category))) { score += 0.18; strongSignals += 1; }
+  if (analysis.subcategory && haystack.includes(normalizeForScoring(analysis.subcategory))) { score += 0.16; strongSignals += 1; }
   if (analysis.industry && haystack.includes(normalizeForScoring(analysis.industry))) score += 0.08;
   const rawWords = normalizeForScoring(need.raw_text).split(/\s+/).filter((word) => word.length > 4);
   const hits = rawWords.filter((word) => haystack.includes(word)).slice(0, 8).length;
-  score += Math.min(0.24, hits * 0.03);
+  if (hits >= 3) strongSignals += 1;
+  score += Math.min(0.18, hits * 0.025);
   const slug = normalizeForScoring(solution.slug || solution.name || "");
   const rawText = normalizeForScoring(need.raw_text || "");
   const wantsDiagnostic = ["client", "clients", "prospect", "vente", "priorite", "priorites", "ameliorer", "activite", "blocage", "pourquoi"].some((word) => rawText.includes(word));
-  if (wantsDiagnostic && (slug.includes("analyse-express") || haystack.includes("analyse express") || haystack.includes("audit"))) score += 0.42;
+  if (wantsDiagnostic && (slug.includes("analyse-express") || haystack.includes("analyse express") || haystack.includes("audit"))) { score += 0.42; strongSignals += 1; }
   if (solution.public && solution.active) score += 0.08;
+  if (strongSignals < 2 && score < AI_MATCH_THRESHOLD_HIGH) return 0;
   return clampScore(score, 0);
 }
 
 async function matchNeedSolutions(need, analysis) {
   const result = await supabaseSelect("solutions", {
-    select: "id,type,name,slug,description,problems_solved,target_users,industries,price_model,price,recurring,internal_or_external,product_id,active,public,metadata",
+    select: "id,type,name,slug,description,problems_solved,target_users,industries,price_model,billing_model,credit_cost,compatible_subscription_codes,target_profile,solution_instructions,access_rights,price,recurring,internal_or_external,product_id,active,public,metadata",
     active: "eq.true",
     order: "updated_at.desc",
     limit: "80"
@@ -2101,6 +2298,7 @@ async function matchNeedSolutions(need, analysis) {
 
 function productToResolveSolution(product) {
   const metadata = product?.metadata && typeof product.metadata === "object" ? product.metadata : {};
+  const billingModel = productBillingModel(product);
   return {
     id: product.id,
     type: product.product_type === "app" ? "APP"
@@ -2110,23 +2308,31 @@ function productToResolveSolution(product) {
       : "PRODUCT",
     name: product.title,
     slug: product.slug,
-    description: [product.short_description, product.description].filter(Boolean).join(" "),
+    description: [product.problem_solved, product.short_description, product.description].filter(Boolean).join(" "),
     problems_solved: [
+      product.problem_solved,
       ...(Array.isArray(metadata.intents) ? metadata.intents : []),
       ...(Array.isArray(metadata.catalogue_filters) ? metadata.catalogue_filters : []),
       ...(Array.isArray(metadata.solution_tags) ? metadata.solution_tags : []),
+      ...(Array.isArray(product.solution_keywords) ? product.solution_keywords : []),
       ...(Array.isArray(product.tags) ? product.tags : [])
-    ],
-    target_users: Array.isArray(metadata.target_users) ? metadata.target_users : [],
+    ].filter(Boolean),
+    target_users: arrayOfCleanStrings([product.target_profile, ...(Array.isArray(metadata.target_users) ? metadata.target_users : [])], 12),
     industries: Array.isArray(metadata.industries) ? metadata.industries : [],
-    price_model: product.pricing_model || "one_time",
+    price_model: product.pricing_model || legacyPricingModelFromBilling(billingModel),
+    billing_model: billingModel,
+    credit_cost: Number(product.credit_cost || 0),
+    compatible_subscription_codes: Array.isArray(product.compatible_subscription_codes) ? product.compatible_subscription_codes : [],
+    target_profile: product.target_profile || "",
+    solution_instructions: product.solution_instructions || "",
+    access_rights: product.access_rights || {},
     price: product.price_cents == null ? null : Number(product.price_cents || 0) / 100,
-    recurring: product.pricing_model === "subscription",
+    recurring: billingModel === "SUBSCRIPTION" || product.pricing_model === "subscription",
     internal_or_external: product.provider_type === "verified_partner" ? "partner" : "internal",
     product_id: product.id,
     active: product.status === "published",
     public: product.status === "published",
-    metadata: { source: "product_publish_alert", product_type: product.product_type, ...(metadata || {}) }
+    metadata: { source: "product_publish_alert", product_type: product.product_type, billing_model: billingModel, ...(metadata || {}) }
   };
 }
 
@@ -2141,6 +2347,12 @@ async function upsertSolutionFromProduct(product) {
     target_users: solution.target_users,
     industries: solution.industries,
     price_model: solution.price_model,
+    billing_model: solution.billing_model,
+    credit_cost: solution.credit_cost,
+    compatible_subscription_codes: solution.compatible_subscription_codes,
+    target_profile: solution.target_profile,
+    solution_instructions: solution.solution_instructions,
+    access_rights: solution.access_rights,
     price: solution.price,
     recurring: solution.recurring,
     internal_or_external: solution.internal_or_external,
@@ -2547,8 +2759,11 @@ async function recordUsageEvent({
   });
 }
 
-async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
+async function analyzeNeedAfterSubmission(need, payloadRisk = null, options = {}) {
   if (!need?.id) return { skipped: true, reason: "missing_need" };
+  const operationName = cleanString(options.operation || "need_analysis") || "need_analysis";
+  const chargeWallet = options.chargeWallet === true;
+  const externalReferenceSuffix = cleanString(options.externalReferenceSuffix || "v1") || "v1";
   const prompt = await activeNeedPrompt();
   const startedRun = await supabaseInsert("ai_analysis_runs", {
     need_id: need.id,
@@ -2572,20 +2787,27 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
   let modelResult = null;
   let aiStatus = "completed";
   let errorMessage = "";
-  let usageReservation = { skipped: true, reason: USAGE_GATE_ENFORCED ? "no_authenticated_user" : "usage_gate_dry_run" };
-  const usageExternalReference = `need_analysis:${need.id}:${runId || "run"}:v1`;
+  let usageReservation = {
+    skipped: true,
+    reason: USAGE_GATE_ENFORCED
+      ? (chargeWallet ? "no_authenticated_user" : "not_billable")
+      : "usage_gate_dry_run"
+  };
+  const usageExternalReference = cleanString(options.externalReference)
+    || `${operationName}:${need.id}:${runId || "run"}:${externalReferenceSuffix}`;
   try {
-    if (USAGE_GATE_ENFORCED && need.user_id) {
+    if (USAGE_GATE_ENFORCED && need.user_id && chargeWallet) {
       usageReservation = await reserveUsageCredits({
         userId: need.user_id,
-        operation: "need_analysis",
+        operation: operationName,
         credits: USAGE_GATE_NEED_ANALYSIS_CREDITS,
         externalReference: usageExternalReference,
         metadata: {
           need_id: need.id,
           run_id: runId || null,
           mode: "enforced",
-          consumption_order: ["free_entitlement", "subscription_entitlement", "wallet_credits"]
+          ...(options.usageMetadata || {}),
+          consumption_order: options.consumptionOrder || ["free_entitlement", "subscription_entitlement", "wallet_credits"]
         }
       });
       if (!usageReservation.ok) {
@@ -2602,7 +2824,7 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
       needId: need.id,
       userId: need.user_id || null,
       sessionId: need.session_id || "",
-      operation: "need_analysis"
+      operation: operationName
     });
     if (analysis) {
       // UsageGate blocked the paid path. Keep the raw need and return a safe free fallback.
@@ -2733,7 +2955,7 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
     userId: need.user_id || null,
     needId: need.id,
     sessionId: need.session_id || null,
-    operation: "need_analysis",
+    operation: operationName,
     provider: "openai",
     model: modelUsed,
     usageSummary,
@@ -2746,13 +2968,14 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
       next_status: nextStatus,
       confidence: analysis.confidence_score,
       matches: matches.length,
+      ...(options.usageMetadata || {}),
       usage_gate: {
         enforced: USAGE_GATE_ENFORCED,
         reservation_id: usageReservation?.reservation?.id || null,
         reservation_status: usageReservation?.reservation?.status || usageReservation?.status || null,
         dry_run: !USAGE_GATE_ENFORCED,
         estimated_or_reserved_credits: USAGE_GATE_ENFORCED ? Number(usageReservation?.reservation?.reserved_credits || 0) : estimatedCreditsForUsage,
-        consumption_order: ["free_entitlement", "subscription_entitlement", "wallet_credits"]
+        consumption_order: options.consumptionOrder || ["free_entitlement", "subscription_entitlement", "wallet_credits"]
       },
       note: USAGE_GATE_ENFORCED
         ? "UsageGate actif : debit uniquement apres resultat livre."
@@ -2784,7 +3007,7 @@ async function analyzeNeedAfterSubmission(need, payloadRisk = null) {
           entityType: "need",
           entityId: need.id,
           metadata: {
-            operation: "need_analysis",
+            operation: operationName,
             charged_credits: chargedUsageCredits,
             reservation_id: usageReservation.reservation.id,
             usage_event_id: usageEventId || null
@@ -2933,6 +3156,31 @@ function stripeParams(input = {}) {
 function productAmountCents(product) {
   const amount = product?.price_cents ?? product?.stripe_price_amount;
   return Number.isFinite(Number(amount)) ? Number(amount) : null;
+}
+
+function normalizeBillingModel(value, legacyPricing = "") {
+  const raw = cleanString(value || legacyPricing || "ONE_TIME").toUpperCase();
+  const normalized = raw.replace(/[-\s]+/g, "_");
+  if (["FREE", "ONE_TIME", "CREDITS", "SUBSCRIPTION", "HYBRID"].includes(normalized)) return normalized;
+  const legacy = cleanString(value || legacyPricing || "").toLowerCase();
+  if (legacy === "free") return "FREE";
+  if (legacy === "subscription") return "SUBSCRIPTION";
+  if (legacy === "credits") return "CREDITS";
+  if (["pack", "team", "marketplace_commission"].includes(legacy)) return "HYBRID";
+  return "ONE_TIME";
+}
+
+function legacyPricingModelFromBilling(billingModel, fallback = "one_time") {
+  const model = normalizeBillingModel(billingModel, fallback);
+  if (model === "FREE") return "free";
+  if (model === "SUBSCRIPTION") return "subscription";
+  if (model === "CREDITS") return "credits";
+  if (model === "HYBRID") return "pack";
+  return fallback || "one_time";
+}
+
+function productBillingModel(product = {}) {
+  return normalizeBillingModel(product.billing_model, product.pricing_model || product.price_model);
 }
 
 function productEstimatedCostCents(product = {}, plan = null) {
@@ -3193,6 +3441,121 @@ async function usageRowsForPeriod(userId, { start, end, limit = 200 } = {}) {
   return { rows: filtered, error: result.ok ? null : result.message };
 }
 
+function weeklyDeepDiveWindow(now = new Date()) {
+  const start = new Date(now);
+  const day = start.getUTCDay() || 7;
+  start.setUTCHours(0, 0, 0, 0);
+  start.setUTCDate(start.getUTCDate() - day + 1);
+  const end = new Date(start);
+  end.setUTCDate(start.getUTCDate() + 7);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+async function freeDeepDiveStatus(userId, now = new Date()) {
+  const window = weeklyDeepDiveWindow(now);
+  if (!userId) {
+    return {
+      limit: FREE_WEEKLY_DEEP_DIVES,
+      used: 0,
+      remaining: 0,
+      reset_at: window.end,
+      requires_account: true,
+      storage: { ok: false, reason: "account_required" }
+    };
+  }
+  const usage = await usageRowsForPeriod(userId, { start: window.start, end: window.end, limit: 120 });
+  const used = usage.rows.filter((row) => {
+    const meta = row.metadata || {};
+    return row.operation === "need_deep_dive"
+      && row.status !== "failed"
+      && row.status !== "released"
+      && (meta.free_weekly_deep_dive === true || meta.freeDeepDive === true);
+  }).length;
+  return {
+    limit: FREE_WEEKLY_DEEP_DIVES,
+    used,
+    remaining: Math.max(FREE_WEEKLY_DEEP_DIVES - used, 0),
+    reset_at: window.end,
+    period_start: window.start,
+    period_end: window.end,
+    storage: usage.error ? { ok: false, error: usage.error } : { ok: true }
+  };
+}
+
+async function subscriptionDeepDiveStatus(userId, now = new Date()) {
+  if (!userId) {
+    return {
+      limit: 0,
+      used: 0,
+      remaining: 0,
+      reset_at: null,
+      subscription: null,
+      storage: { ok: false, reason: "account_required" }
+    };
+  }
+  const subscription = await activeUserSubscription(userId);
+  if (!subscription || subscriptionAccessStatus(subscription.status) !== "active") {
+    return {
+      limit: 0,
+      used: 0,
+      remaining: 0,
+      reset_at: subscription?.current_period_end || null,
+      subscription: subscription ? {
+        id: subscription.id,
+        status: subscription.status,
+        plan_code: subscription.metadata?.planCode || subscription.metadata?.plan_code || null
+      } : null,
+      storage: { ok: true, reason: "no_active_subscription" }
+    };
+  }
+  const plan = subscriptionPlanFromMetadata(subscription);
+  const meta = subscription.metadata || {};
+  const limit = Math.max(0, Number(meta.deep_dives || meta.deepDives || plan?.deep_dives || 0));
+  const start = subscription.current_period_start || new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+  const end = subscription.current_period_end || null;
+  const usage = await usageRowsForPeriod(userId, { start, end, limit: 200 });
+  const used = usage.rows.filter((row) => {
+    const metaRow = row.metadata || {};
+    return row.operation === "need_deep_dive"
+      && row.status !== "failed"
+      && row.status !== "released"
+      && (metaRow.subscription_deep_dive === true || metaRow.subscriptionDeepDive === true)
+      && (!metaRow.subscription_id || metaRow.subscription_id === subscription.id);
+  }).length;
+  return {
+    limit,
+    used,
+    remaining: Math.max(limit - used, 0),
+    reset_at: end,
+    period_start: start,
+    period_end: end,
+    subscription: {
+      id: subscription.id,
+      status: subscription.status,
+      plan_code: plan?.code || meta.planCode || meta.plan_code || null,
+      plan_name: plan?.name || meta.planName || meta.plan_name || "Abonnement ChronoTrade"
+    },
+    storage: usage.error ? { ok: false, error: usage.error } : { ok: true }
+  };
+}
+
+async function deepDiveEntitlementStatus(userId) {
+  const freeWeekly = await freeDeepDiveStatus(userId);
+  const subscriptionDepth = await subscriptionDeepDiveStatus(userId);
+  const nextSource = freeWeekly.remaining > 0
+    ? "free_weekly"
+    : subscriptionDepth.remaining > 0
+      ? "subscription_depth"
+      : "credits";
+  return {
+    next_source: nextSource,
+    credit_cost: USAGE_GATE_NEED_ANALYSIS_CREDITS,
+    free_weekly: freeWeekly,
+    subscription_depth: subscriptionDepth,
+    wallet_required: nextSource === "credits"
+  };
+}
+
 function usageCredits(row) {
   const charged = Number(row?.charged_credits || 0);
   if (Number.isFinite(charged) && charged > 0) return charged;
@@ -3332,6 +3695,8 @@ function formatMoneyCents(amountCents, currency = "EUR") {
 
 function isPaidProduct(product) {
   const amount = productAmountCents(product);
+  const billingModel = productBillingModel(product);
+  if (billingModel === "FREE" || billingModel === "CREDITS") return false;
   return amount !== null && amount > 0;
 }
 
@@ -3563,7 +3928,7 @@ async function syncPlanWithStripe(product, plan, reason = "plan_sync") {
       "metadata[chronotrade_slug]": product.slug,
       "metadata[source]": "chronotrade_super_admin_plan"
     };
-    if (plan.pricing_model === "subscription") {
+    if (productBillingModel(plan) === "SUBSCRIPTION" || plan.pricing_model === "subscription") {
       params["recurring[interval]"] = plan.interval || "month";
       params["recurring[interval_count]"] = Number(plan.interval_count || 1);
     }
@@ -4448,6 +4813,178 @@ async function handleResolveClarification(req, res, needId) {
   }
 }
 
+async function handleResolveMessage(req, res, needId) {
+  try {
+    const body = await readRequestBody(req);
+    const authUser = await supabaseAuthUser(req);
+    const message = cleanString(body.message || body.answer || body.text);
+    if (message.length < 2) return jsonResponse(res, 422, { ok: false, error: "Message trop court." });
+    if (!authUser?.id) {
+      return jsonResponse(res, 401, {
+        ok: false,
+        code: "account_required_for_deep_dive",
+        error: "Connectez-vous pour continuer cette conversation sans perdre l'historique."
+      });
+    }
+    const lookup = await supabaseSelect("needs", { select: "*", id: `eq.${cleanString(needId)}`, limit: "1" });
+    const need = lookup.ok && Array.isArray(lookup.data) ? lookup.data[0] : null;
+    if (!need?.id) return jsonResponse(res, 404, { ok: false, error: "Demande introuvable." });
+    const sameSession = cleanString(body.session_id) && cleanString(body.session_id) === cleanString(need.session_id);
+    const ownsNeed = authUser.id && authUser.id === need.user_id;
+    if (need.user_id && !ownsNeed) return jsonResponse(res, 403, { ok: false, error: "Cette conversation appartient a un autre compte." });
+    if (!need.user_id && !sameSession) return jsonResponse(res, 403, { ok: false, error: "Cette conversation ne peut pas etre reprise depuis cette session." });
+
+    const beforeEntitlements = await deepDiveEntitlementStatus(authUser.id);
+    const wantsCredits = Boolean(body.use_credits || body.useCredits || body.accept_credit_charge);
+    if (beforeEntitlements.next_source === "credits" && !wantsCredits) {
+      return jsonResponse(res, 402, {
+        ok: false,
+        code: "free_deep_dive_exhausted",
+        error: "Vos approfondissements inclus sont utilises pour le moment. Votre probleme reste sauvegarde : vous pouvez continuer avec vos credits ou reprendre au prochain renouvellement.",
+        free_deep_dives: beforeEntitlements.free_weekly,
+        subscription_deep_dives: beforeEntitlements.subscription_depth,
+        entitlements: beforeEntitlements,
+        credit_cost: USAGE_GATE_NEED_ANALYSIS_CREDITS
+      });
+    }
+    const entitlementSource = beforeEntitlements.next_source;
+    const consumesFreeWeekly = entitlementSource === "free_weekly";
+    const consumesSubscriptionDepth = entitlementSource === "subscription_depth";
+    const consumesWalletCredits = entitlementSource === "credits";
+
+    const now = new Date().toISOString();
+    const clientMessageId = cleanString(body.client_message_id || body.idempotency_key) || randomUUID();
+    await recordNeedEvent(need.id, authUser.id, "conversation_message", {
+      note: message,
+      metadata: {
+        source: "resolve_mini_chat",
+        client_message_id: clientMessageId,
+        entitlement_source: entitlementSource,
+        used_free_deep_dive: consumesFreeWeekly,
+        used_subscription_deep_dive: consumesSubscriptionDepth,
+        use_credits_requested: wantsCredits
+      }
+    });
+    if (!need.user_id && sameSession) {
+      await supabaseUpdate("needs", {
+        user_id: authUser.id,
+        contact_email: cleanString(need.contact_email || authUser.email || null),
+        email: cleanString(need.email || authUser.email || null),
+        updated_at: now
+      }, { id: `eq.${need.id}` }, { returnRepresentation: false });
+    }
+    const priorState = need.metadata?.narrative_state || need.metadata?.reasoning_state || {};
+    const contextLines = [
+      "Probleme initial:",
+      need.raw_text || need.title || "",
+      "",
+      "Etat connu avant ce message:",
+      JSON.stringify({
+        known_facts: priorState.known_facts || priorState.explicit_facts || [],
+        unknowns: priorState.unknowns || [],
+        hypotheses: priorState.hypotheses || [],
+        actions_proposed: priorState.actions_proposed || [],
+        actions_tested: priorState.actions_tested || [],
+        selected_solution: priorState.selected_solution || null
+      }).slice(0, 2400),
+      "",
+      "Nouveau message utilisateur:",
+      message
+    ].join("\n");
+    const enrichedNeed = {
+      ...need,
+      user_id: need.user_id || authUser.id,
+      raw_text: contextLines,
+      title: need.title || message.slice(0, 90),
+      metadata: {
+        ...(need.metadata || {}),
+        latest_conversation_message: {
+          message,
+          received_at: now,
+          client_message_id: clientMessageId
+        }
+      }
+    };
+    const ai = await analyzeNeedAfterSubmission(enrichedNeed, detectResolveRiskServer(contextLines), {
+      operation: "need_deep_dive",
+      chargeWallet: consumesWalletCredits,
+      externalReference: `need_deep_dive:${need.id}:${authUser.id}:${clientMessageId}:v1`,
+      consumptionOrder: consumesFreeWeekly
+        ? ["free_weekly"]
+        : consumesSubscriptionDepth
+          ? ["subscription_depth"]
+          : ["wallet_credits"],
+      usageMetadata: {
+        entitlement_source: entitlementSource,
+        free_weekly_deep_dive: consumesFreeWeekly,
+        subscription_deep_dive: consumesSubscriptionDepth,
+        subscription_id: consumesSubscriptionDepth ? beforeEntitlements.subscription_depth?.subscription?.id || null : null,
+        plan_code: consumesSubscriptionDepth ? beforeEntitlements.subscription_depth?.subscription?.plan_code || null : null,
+        free_deep_dive_remaining_before: beforeEntitlements.free_weekly?.remaining || 0,
+        subscription_deep_dive_remaining_before: beforeEntitlements.subscription_depth?.remaining || 0,
+        client_message_id: clientMessageId,
+        conversation_turn: true
+      }
+    });
+    const afterEntitlements = await deepDiveEntitlementStatus(authUser.id);
+    const reasoningState = ai?.reasoningState || ai?.narrativeState || buildPublicReasoningState({
+      need: enrichedNeed,
+      analysis: ai?.analysis || {},
+      matches: ai?.matches || [],
+      status: ai?.status || "ANALYZING"
+    });
+    await recordNeedEvent(need.id, authUser.id, "conversation_response", {
+      to_status: ai?.status || null,
+      metadata: {
+        client_message_id: clientMessageId,
+        entitlements: afterEntitlements,
+        free_deep_dives: afterEntitlements.free_weekly,
+        subscription_deep_dives: afterEntitlements.subscription_depth,
+        matches: ai?.matches?.length || 0
+      }
+    });
+    return jsonResponse(res, 201, {
+      ok: true,
+      status: ai?.status || "ANALYZING",
+      need: { id: need.id, status: ai?.status || need.status, ref: `REQ-${String(need.id).slice(0, 8).toUpperCase()}` },
+      understood: {
+        summary: ai?.analysis?.summary || null,
+        primaryProblem: ai?.analysis?.primary_problem || null,
+        desiredOutcome: ai?.analysis?.desired_outcome || null,
+        category: ai?.analysis?.category || null,
+        confidence: ai?.analysis?.confidence_score ?? null
+      },
+      nextAction: ai?.analysis?.desired_outcome || ai?.analysis?.user_facing_suggestion || null,
+      suggestion: ai?.analysis?.user_facing_suggestion || null,
+      questions: reasoningState.selected_question ? [reasoningState.selected_question] : [],
+      raw_text: need.raw_text,
+      narrative_state: { ...reasoningState, updated_by: "conversation_message" },
+      reasoning_state: { ...reasoningState, updated_by: "conversation_message" },
+      free_deep_dives: afterEntitlements.free_weekly,
+      subscription_deep_dives: afterEntitlements.subscription_depth,
+      entitlements: afterEntitlements,
+      credits: {
+        cost_if_paid: USAGE_GATE_NEED_ANALYSIS_CREDITS,
+        charged: consumesWalletCredits && wantsCredits,
+        source: entitlementSource
+      },
+      matches: (ai?.matches || []).map((match) => ({
+        solutionId: match.solution_id,
+        score: match.score,
+        confidenceBand: match.confidence_band,
+        name: match.solution?.name || "",
+        slug: match.solution?.slug || "",
+        type: match.solution?.type || "",
+        productId: match.solution?.product_id || null,
+        reason: match.user_facing_copy || match.match_reason || ""
+      })),
+      noCurrentSolution: (ai?.status || "") === "UNRESOLVED"
+    });
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+}
+
 async function handleResolveCorrection(req, res, needId) {
   try {
     const body = await readRequestBody(req);
@@ -5121,7 +5658,8 @@ async function dynamicCheckoutBody(fields = {}, options = {}) {
   const syncedProduct = sync.product;
   const syncedPlan = sync.plan || null;
   const checkoutPriceId = syncedPlan?.stripe_price_id || syncedProduct.stripe_price_id;
-  const pricingModel = syncedPlan?.pricing_model || syncedProduct.pricing_model || "one_time";
+  const billingModel = productBillingModel(syncedPlan || syncedProduct);
+  const pricingModel = syncedPlan?.pricing_model || syncedProduct.pricing_model || legacyPricingModelFromBilling(billingModel);
   const stripeCustomerId = await ensureStripeCustomerForUser(authUser);
   const requestedPromotionCode = fields.promotion_code || fields.promo || "";
   let promotion = requestedPromotionCode
@@ -5137,7 +5675,7 @@ async function dynamicCheckoutBody(fields = {}, options = {}) {
   returnUrl.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}");
 
   const body = new URLSearchParams({
-    mode: pricingModel === "subscription" ? "subscription" : "payment",
+    mode: billingModel === "SUBSCRIPTION" || pricingModel === "subscription" ? "subscription" : "payment",
     customer: stripeCustomerId,
     "line_items[0][price]": checkoutPriceId,
     "line_items[0][quantity]": "1",
@@ -5148,9 +5686,11 @@ async function dynamicCheckoutBody(fields = {}, options = {}) {
     "metadata[plan_slug]": syncedPlan?.slug || "",
     "metadata[user_id]": authUser.id,
     "metadata[delivery_type]": syncedProduct.delivery_type || "",
+    "metadata[billing_model]": billingModel,
+    "metadata[credit_cost]": String(syncedPlan?.credit_cost || syncedProduct.credit_cost || 0),
     "metadata[source]": "chronotrade_dynamic_checkout"
   });
-  if (pricingModel !== "subscription") body.set("submit_type", syncedProduct.delivery_type === "questionnaire" ? "book" : "pay");
+  if (billingModel !== "SUBSCRIPTION" && pricingModel !== "subscription") body.set("submit_type", syncedProduct.delivery_type === "questionnaire" ? "book" : "pay");
   if (fields.checkout_mode === "redirect" || options.hosted) {
     body.set("success_url", returnUrl.toString());
     body.set("cancel_url", `${SITE_ORIGIN}/produit/?slug=${encodeURIComponent(syncedProduct.slug)}&paiement=cancel`);
@@ -5158,10 +5698,10 @@ async function dynamicCheckoutBody(fields = {}, options = {}) {
     body.set("ui_mode", "embedded");
     body.set("return_url", returnUrl.toString());
   }
-  if (pricingModel === "subscription" && Number(syncedPlan?.trial_days || syncedProduct.commerce_config?.trial_days || 0) > 0) {
+  if ((billingModel === "SUBSCRIPTION" || pricingModel === "subscription") && Number(syncedPlan?.trial_days || syncedProduct.commerce_config?.trial_days || 0) > 0) {
     body.set("subscription_data[trial_period_days]", String(Number(syncedPlan?.trial_days || syncedProduct.commerce_config?.trial_days || 0)));
   }
-  if (pricingModel === "subscription") {
+  if (billingModel === "SUBSCRIPTION" || pricingModel === "subscription") {
     body.set("subscription_data[metadata][product_id]", syncedProduct.id);
     body.set("subscription_data[metadata][product_slug]", syncedProduct.slug);
     body.set("subscription_data[metadata][plan_id]", syncedPlan?.id || "");
@@ -5424,6 +5964,19 @@ async function orderFromStripeSession(session) {
   const latestCharge = paymentIntent.latest_charge || paymentIntent.charges?.data?.[0] || {};
   const status = session.payment_status === "paid" ? "paid" : session.payment_status || "pending";
   const accessUrl = productAccessUrl(dbProduct || { slug: product, delivery_type: session.metadata?.delivery_type }, session.id);
+  const billingModel = normalizeBillingModel(session.metadata?.billing_model || dbProduct?.billing_model, dbProduct?.pricing_model);
+  const billingSnapshot = {
+    billing_model: billingModel,
+    pricing_model: dbProduct?.pricing_model || session.metadata?.pricing_model || legacyPricingModelFromBilling(billingModel),
+    price_cents: dbProduct?.price_cents ?? Number(session.amount_total || 0),
+    credit_cost: Number(dbProduct?.credit_cost || session.metadata?.credit_cost || 0),
+    compatible_subscription_codes: Array.isArray(dbProduct?.compatible_subscription_codes) ? dbProduct.compatible_subscription_codes : [],
+    access_rights: dbProduct?.access_rights || {},
+    delivery_type: dbProduct?.delivery_type || session.metadata?.delivery_type || "",
+    product_version: dbProduct?.current_version || "1.0",
+    stripe_price_id: stripePriceId,
+    captured_at: now
+  };
   return {
     id: session.id || randomUUID(),
     stripeSessionId: session.id || "",
@@ -5433,6 +5986,8 @@ async function orderFromStripeSession(session) {
     productSlug: dbProduct?.slug || product,
     productType: dbProduct?.product_type || "",
     productVersion: dbProduct?.current_version || "1.0",
+    billingModel,
+    billingSnapshot,
     userId: session.metadata?.user_id || "",
     productLabel: dbProduct?.title || (product === "analyse_express" || product === "analyse-express" ? "Analyse Express ChronoTrade" : product),
     deliveryType: dbProduct?.delivery_type || session.metadata?.delivery_type || "",
@@ -5453,6 +6008,7 @@ async function orderFromStripeSession(session) {
     promotionCode: session.metadata?.promotion_code || "",
     raw: {
       mode: session.mode || "",
+      billingModel,
       source: session.metadata?.source || "",
       invoice: typeof session.invoice === "string" ? session.invoice : session.invoice?.id || "",
       created: session.created || null,
@@ -5496,6 +6052,8 @@ async function syncSupabaseOrder(order) {
     stripe_payment_intent: typeof order.stripePaymentIntent === "string" ? order.stripePaymentIntent : order.stripePaymentIntent?.id || null,
     stripe_price_id: order.stripePriceId || null,
     promotion_id: order.promotionId || null,
+    billing_model: order.billingModel || order.billingSnapshot?.billing_model || null,
+    billing_snapshot: order.billingSnapshot || null,
     paid_at: order.status === "paid" ? new Date().toISOString() : null,
     invoice_url: order.invoiceUrl || null,
     receipt_url: order.receiptUrl || null,
@@ -5507,6 +6065,8 @@ async function syncSupabaseOrder(order) {
       productSlug: order.productSlug || null,
       deliveryType: order.deliveryType || null,
       productVersion: order.productVersion || null,
+      billingModel: order.billingModel || order.billingSnapshot?.billing_model || null,
+      billingSnapshot: order.billingSnapshot || null,
       userId: userId || null,
       paymentStatus: order.status || null,
       stripeSessionId: order.stripeSessionId || null,
@@ -6191,6 +6751,7 @@ async function handleWalletSummary(req, res) {
     const periodEnd = activeSubscription?.current_period_end || null;
     const usageRows = await usageRowsForPeriod(user.id, { start: periodStart, end: periodEnd, limit: 200 });
     const usageDetails = usageSummaryForWallet(usageRows.rows, plan);
+    const deepDiveEntitlements = await deepDiveEntitlementStatus(user.id);
     const plans = (await configuredBillingPlansLive()).filter((item) => item.visible !== false && item.status === "active");
     const recommendation = walletRecommendation({ ledgerRows: rows, activePlan: activeSubscription });
     return jsonResponse(res, 200, {
@@ -6199,6 +6760,9 @@ async function handleWalletSummary(req, res) {
         balance_credits: balance,
         free_monthly_credits: FREE_MONTHLY_CREDITS,
         free_weekly_deep_dives: FREE_WEEKLY_DEEP_DIVES,
+        free_deep_dives: deepDiveEntitlements.free_weekly,
+        subscription_deep_dives: deepDiveEntitlements.subscription_depth,
+        deep_dive_entitlements: deepDiveEntitlements,
         welcome_credits: WELCOME_CREDITS,
         credits_per_eur: CREDITS_PER_EUR,
         min_purchase_eur: CREDIT_MIN_PURCHASE_EUR
@@ -6206,6 +6770,9 @@ async function handleWalletSummary(req, res) {
       usage: {
         quota_remaining: usageDetails.free_remaining + usageDetails.subscription_remaining + balance,
         next_reset_at: activeSubscription?.current_period_end || null,
+        free_deep_dives: deepDiveEntitlements.free_weekly,
+        subscription_deep_dives: deepDiveEntitlements.subscription_depth,
+        deep_dive_entitlements: deepDiveEntitlements,
         period_start: periodStart,
         period_end: periodEnd,
         ...usageDetails,
@@ -6753,6 +7320,9 @@ createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/api/resolve/needs") return handleResolveNeed(req, res);
   if (req.method === "POST" && url.pathname.startsWith("/api/resolve/needs/") && url.pathname.endsWith("/clarification")) {
     return handleResolveClarification(req, res, url.pathname.replace("/api/resolve/needs/", "").replace("/clarification", ""));
+  }
+  if (req.method === "POST" && url.pathname.startsWith("/api/resolve/needs/") && url.pathname.endsWith("/message")) {
+    return handleResolveMessage(req, res, url.pathname.replace("/api/resolve/needs/", "").replace("/message", ""));
   }
   if (req.method === "POST" && url.pathname.startsWith("/api/resolve/needs/") && url.pathname.endsWith("/correction")) {
     return handleResolveCorrection(req, res, url.pathname.replace("/api/resolve/needs/", "").replace("/correction", ""));

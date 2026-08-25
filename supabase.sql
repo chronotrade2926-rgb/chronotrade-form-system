@@ -21,11 +21,7 @@ create table if not exists public.admin_emails (
 );
 
 insert into public.admin_emails(email)
-values ('flo.chronotrade@outlook.fr')
-on conflict (email) do nothing;
-
-insert into public.admin_emails(email)
-values ('bouchonnetflorent@gmail.com'), ('chronotrade2926@gmail.com')
+values ('bouchonnetflorent@gmail.com')
 on conflict (email) do nothing;
 
 create table if not exists public.partners (

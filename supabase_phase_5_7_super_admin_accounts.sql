@@ -4,13 +4,12 @@
 
 insert into public.admin_emails(email)
 values
-  ('bouchonnetflorent@gmail.com'),
-  ('chronotrade2926@gmail.com')
+  ('bouchonnetflorent@gmail.com')
 on conflict (email) do nothing;
 
 update public.users
 set role = 'super_admin', updated_at = now()
-where lower(email) in ('bouchonnetflorent@gmail.com', 'chronotrade2926@gmail.com');
+where lower(email) = 'bouchonnetflorent@gmail.com';
 
 create or replace function public.handle_new_auth_user()
 returns trigger
@@ -25,7 +24,7 @@ begin
   normalized_email := lower(coalesce(new.email, ''));
   requested_role := coalesce(new.raw_user_meta_data->>'role', 'client');
 
-  if normalized_email in ('bouchonnetflorent@gmail.com', 'chronotrade2926@gmail.com') then
+  if normalized_email = 'bouchonnetflorent@gmail.com' then
     requested_role := 'super_admin';
   elsif normalized_email in (select lower(email) from public.admin_emails) then
     requested_role := 'admin';
